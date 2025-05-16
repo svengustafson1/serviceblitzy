@@ -13,6 +13,9 @@ yarn-error.log
 .env.development
 .env.test
 .env.production
+*/environment/*.env
+**/environment/*.env
+project_backup_*/environment/*.env
 
 # Build outputs
 dist/
