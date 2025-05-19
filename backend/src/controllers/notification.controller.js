@@ -1,14 +1,26 @@
 /**
  * Notification Controller
  * Handles all operations related to user notifications
+ * Includes WebSocket event emission for real-time notifications
+ * and fallback to HTTP polling when WebSocket is unavailable
  */
+
+const { getWebSocketService } = require('../services/websocket.service');
+const { createLogger } = require('../utils/logger');
+
+const logger = createLogger('notification-controller');
+
+// In-memory store for pending notifications when WebSocket is unavailable
+// This is a simple implementation - in production, use Redis or a database
+const pendingNotifications = new Map(); // userId -> array of notifications
 
 /**
  * Create a new notification
  * @param {Object} client - PostgreSQL client
  * @param {Object} notification - Notification data
+ * @param {String} [deliveryChannel='all'] - Delivery channel ('websocket', 'http', 'all')
  */
-const createNotification = async (client, notification) => {
+const createNotification = async (client, notification, deliveryChannel = 'all') => {
   const {
     user_id,
     title,
@@ -23,16 +35,17 @@ const createNotification = async (client, notification) => {
   try {
     // Validate required fields
     if (!user_id || !title || !message) {
-      console.error('Missing required fields for notification');
+      logger.error('Missing required fields for notification');
       return null;
     }
 
-    // Create the notification
+    // Create the notification with delivery status tracking
     const result = await client.query(`
       INSERT INTO notifications (
-        user_id, title, message, type, related_to, related_id, actions, expires_at
+        user_id, title, message, type, related_to, related_id, actions, expires_at,
+        delivery_status, delivery_channel, delivery_attempts
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *
     `, [
       user_id,
@@ -42,13 +55,134 @@ const createNotification = async (client, notification) => {
       related_to,
       related_id,
       actions ? JSON.stringify(actions) : null,
-      expires_at
+      expires_at,
+      'pending', // Initial delivery status
+      deliveryChannel,
+      0 // Initial delivery attempts
     ]);
 
-    return result.rows[0];
+    const newNotification = result.rows[0];
+
+    // Attempt to deliver via WebSocket if available and channel is 'websocket' or 'all'
+    if (deliveryChannel === 'websocket' || deliveryChannel === 'all') {
+      await deliverViaWebSocket(client, newNotification);
+    }
+
+    return newNotification;
   } catch (error) {
-    console.error('Error creating notification:', error);
+    logger.error('Error creating notification:', error);
     return null;
+  }
+};
+
+/**
+ * Deliver notification via WebSocket
+ * @param {Object} client - PostgreSQL client
+ * @param {Object} notification - Notification data
+ */
+const deliverViaWebSocket = async (client, notification) => {
+  try {
+    const webSocketService = getWebSocketService();
+    
+    // If WebSocket service is not available, store for HTTP polling
+    if (!webSocketService) {
+      logger.warn(`WebSocket service not available, storing notification ${notification.id} for HTTP polling`);
+      storeForHttpPolling(notification.user_id, notification);
+      
+      // Update delivery status to 'pending_http'
+      await updateNotificationDeliveryStatus(client, notification.id, 'pending_http', 1);
+      return;
+    }
+
+    // Update delivery attempts before sending
+    await updateNotificationDeliveryStatus(
+      client, 
+      notification.id, 
+      'sending', // Status while attempting delivery
+      notification.delivery_attempts + 1
+    );
+
+    // Attempt to send via WebSocket
+    const result = await webSocketService.sendToUser(
+      notification.user_id.toString(),
+      'notification:new',
+      notification
+    );
+
+    // Update delivery status based on result
+    if (result.delivered) {
+      await updateNotificationDeliveryStatus(client, notification.id, 'delivered', notification.delivery_attempts);
+      logger.debug(`Notification ${notification.id} delivered to user ${notification.user_id} via ${result.method}`);
+    } else {
+      // If WebSocket failed but HTTP fallback succeeded
+      if (result.method === 'http_polling') {
+        await updateNotificationDeliveryStatus(client, notification.id, 'pending_http', notification.delivery_attempts);
+        logger.debug(`Notification ${notification.id} queued for HTTP polling for user ${notification.user_id}`);
+      } else {
+        // Complete failure
+        await updateNotificationDeliveryStatus(client, notification.id, 'failed', notification.delivery_attempts);
+        logger.warn(`Failed to deliver notification ${notification.id} to user ${notification.user_id}: ${result.error}`);
+      }
+    }
+  } catch (error) {
+    logger.error(`Error delivering notification ${notification.id} via WebSocket:`, error);
+    // Store for HTTP polling as fallback
+    storeForHttpPolling(notification.user_id, notification);
+    
+    // Update delivery status to failed
+    await updateNotificationDeliveryStatus(client, notification.id, 'failed', notification.delivery_attempts + 1);
+  }
+};
+
+/**
+ * Update notification delivery status
+ * @param {Object} client - PostgreSQL client
+ * @param {Number} notificationId - Notification ID
+ * @param {String} status - New delivery status
+ * @param {Number} attempts - Number of delivery attempts
+ */
+const updateNotificationDeliveryStatus = async (client, notificationId, status, attempts) => {
+  try {
+    await client.query(`
+      UPDATE notifications
+      SET 
+        delivery_status = $1,
+        delivery_attempts = $2,
+        last_delivery_attempt = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+    `, [status, attempts, notificationId]);
+    
+    return true;
+  } catch (error) {
+    logger.error(`Error updating delivery status for notification ${notificationId}:`, error);
+    return false;
+  }
+};
+
+/**
+ * Store notification for HTTP polling
+ * @param {Number} userId - User ID
+ * @param {Object} notification - Notification data
+ */
+const storeForHttpPolling = (userId, notification) => {
+  if (!pendingNotifications.has(userId)) {
+    pendingNotifications.set(userId, []);
+  }
+  
+  pendingNotifications.get(userId).push({
+    ...notification,
+    pending_since: Date.now()
+  });
+  
+  // Limit the number of pending notifications per user
+  const userNotifications = pendingNotifications.get(userId);
+  if (userNotifications.length > 100) {
+    // Remove oldest notifications if we have too many
+    pendingNotifications.set(
+      userId,
+      userNotifications.slice(userNotifications.length - 100)
+    );
   }
 };
 
@@ -57,8 +191,9 @@ const createNotification = async (client, notification) => {
  * @param {Object} client - PostgreSQL client
  * @param {Array} userIds - Array of user IDs
  * @param {Object} notificationData - Notification data (without user_id)
+ * @param {String} [deliveryChannel='all'] - Delivery channel ('websocket', 'http', 'all')
  */
-const createNotificationForUsers = async (client, userIds, notificationData) => {
+const createNotificationForUsers = async (client, userIds, notificationData, deliveryChannel = 'all') => {
   try {
     const notifications = [];
     
@@ -66,7 +201,7 @@ const createNotificationForUsers = async (client, userIds, notificationData) => 
       const notification = await createNotification(client, {
         ...notificationData,
         user_id: userId
-      });
+      }, deliveryChannel);
       
       if (notification) {
         notifications.push(notification);
@@ -75,7 +210,7 @@ const createNotificationForUsers = async (client, userIds, notificationData) => 
     
     return notifications;
   } catch (error) {
-    console.error('Error creating notifications for multiple users:', error);
+    logger.error('Error creating notifications for multiple users:', error);
     return [];
   }
 };
@@ -85,7 +220,7 @@ const createNotificationForUsers = async (client, userIds, notificationData) => 
  * @route GET /api/notifications
  */
 const getUserNotifications = async (req, res) => {
-  const { unread_only, limit = 20, offset = 0 } = req.query;
+  const { unread_only, limit = 20, offset = 0, delivery_status } = req.query;
   const client = req.db;
   
   try {
@@ -104,6 +239,13 @@ const getUserNotifications = async (req, res) => {
       query += ` AND is_read = FALSE`;
     }
     
+    // Filter by delivery status if specified
+    if (delivery_status) {
+      query += ` AND delivery_status = $${paramIndex}`;
+      queryParams.push(delivery_status);
+      paramIndex++;
+    }
+    
     // Order by created_at (newest first) and add pagination
     query += ` 
       ORDER BY created_at DESC
@@ -115,10 +257,19 @@ const getUserNotifications = async (req, res) => {
     const result = await client.query(query, queryParams);
     
     // Get total count for pagination
-    const countResult = await client.query(
-      `SELECT COUNT(*) FROM notifications WHERE user_id = $1 ${unread_only === 'true' ? 'AND is_read = FALSE' : ''}`,
-      [req.user.id]
-    );
+    let countQuery = `SELECT COUNT(*) FROM notifications WHERE user_id = $1`;
+    const countParams = [req.user.id];
+    
+    if (unread_only === 'true') {
+      countQuery += ` AND is_read = FALSE`;
+    }
+    
+    if (delivery_status) {
+      countQuery += ` AND delivery_status = $2`;
+      countParams.push(delivery_status);
+    }
+    
+    const countResult = await client.query(countQuery, countParams);
     
     const totalCount = parseInt(countResult.rows[0].count);
     
@@ -138,7 +289,7 @@ const getUserNotifications = async (req, res) => {
       data: result.rows
     });
   } catch (error) {
-    console.error('Error getting user notifications:', error);
+    logger.error('Error getting user notifications:', error);
     res.status(500).json({
       success: false,
       message: 'Error fetching notifications',
@@ -185,6 +336,16 @@ const markNotificationsAsRead = async (req, res) => {
       });
     }
     
+    // Emit WebSocket event for read status update
+    const webSocketService = getWebSocketService();
+    if (webSocketService) {
+      webSocketService.sendToUser(
+        req.user.id.toString(),
+        'notification:read',
+        { ids: result.rows.map(row => row.id) }
+      );
+    }
+    
     res.status(200).json({
       success: true,
       message: `${result.rows.length} notifications marked as read`,
@@ -193,7 +354,7 @@ const markNotificationsAsRead = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error marking notifications as read:', error);
+    logger.error('Error marking notifications as read:', error);
     res.status(500).json({
       success: false,
       message: 'Error updating notifications',
@@ -225,6 +386,16 @@ const deleteNotifications = async (req, res) => {
       RETURNING id
     `, [ids, req.user.id]);
     
+    // Emit WebSocket event for deletion
+    const webSocketService = getWebSocketService();
+    if (webSocketService) {
+      webSocketService.sendToUser(
+        req.user.id.toString(),
+        'notification:deleted',
+        { ids: result.rows.map(row => row.id) }
+      );
+    }
+    
     res.status(200).json({
       success: true,
       message: `${result.rows.length} notifications deleted`,
@@ -233,7 +404,7 @@ const deleteNotifications = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error deleting notifications:', error);
+    logger.error('Error deleting notifications:', error);
     res.status(500).json({
       success: false,
       message: 'Error deleting notifications',
@@ -262,15 +433,31 @@ const getNotificationCount = async (req, res) => {
       [req.user.id]
     );
     
+    // Get counts by delivery status
+    const statusCountResult = await client.query(
+      `SELECT delivery_status, COUNT(*) as count 
+       FROM notifications 
+       WHERE user_id = $1 
+       GROUP BY delivery_status`,
+      [req.user.id]
+    );
+    
+    // Convert to object with status as key
+    const statusCounts = {};
+    statusCountResult.rows.forEach(row => {
+      statusCounts[row.delivery_status] = parseInt(row.count);
+    });
+    
     res.status(200).json({
       success: true,
       data: {
         total: parseInt(totalCountResult.rows[0].total),
-        unread: parseInt(unreadCountResult.rows[0].unread)
+        unread: parseInt(unreadCountResult.rows[0].unread),
+        by_status: statusCounts
       }
     });
   } catch (error) {
-    console.error('Error getting notification counts:', error);
+    logger.error('Error getting notification counts:', error);
     res.status(500).json({
       success: false,
       message: 'Error fetching notification counts',
@@ -305,10 +492,310 @@ const getNotificationById = async (req, res) => {
       data: result.rows[0]
     });
   } catch (error) {
-    console.error('Error getting notification:', error);
+    logger.error('Error getting notification:', error);
     res.status(500).json({
       success: false,
       message: 'Error fetching notification',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get notifications by delivery status
+ * @route GET /api/notifications/status/:status
+ */
+const getNotificationsByDeliveryStatus = async (req, res) => {
+  const { status } = req.params;
+  const { limit = 20, offset = 0 } = req.query;
+  const client = req.db;
+  
+  try {
+    // Validate status
+    const validStatuses = ['pending', 'sending', 'delivered', 'failed', 'pending_http'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+    
+    // Get notifications with the specified delivery status
+    const result = await client.query(`
+      SELECT * FROM notifications 
+      WHERE user_id = $1 AND delivery_status = $2
+      ORDER BY created_at DESC
+      LIMIT $3 OFFSET $4
+    `, [req.user.id, status, parseInt(limit), parseInt(offset)]);
+    
+    // Get total count
+    const countResult = await client.query(
+      `SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND delivery_status = $2`,
+      [req.user.id, status]
+    );
+    
+    res.status(200).json({
+      success: true,
+      count: result.rows.length,
+      total: parseInt(countResult.rows[0].count),
+      data: result.rows
+    });
+  } catch (error) {
+    logger.error(`Error getting notifications with status ${status}:`, error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching notifications',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Update notification delivery status
+ * @route PATCH /api/notifications/delivery-status
+ */
+const updateDeliveryStatus = async (req, res) => {
+  const { id, status } = req.body;
+  const client = req.db;
+  
+  try {
+    // Validate required fields
+    if (!id || !status) {
+      return res.status(400).json({
+        success: false,
+        message: 'Notification ID and status are required'
+      });
+    }
+    
+    // Validate status
+    const validStatuses = ['pending', 'sending', 'delivered', 'failed', 'pending_http'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+    
+    // Update delivery status
+    const result = await client.query(`
+      UPDATE notifications
+      SET 
+        delivery_status = $1,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2 AND user_id = $3
+      RETURNING *
+    `, [status, id, req.user.id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found or you do not have permission to update it'
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      message: 'Notification delivery status updated',
+      data: result.rows[0]
+    });
+  } catch (error) {
+    logger.error('Error updating notification delivery status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating notification delivery status',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Retry failed notification delivery
+ * @route POST /api/notifications/retry-delivery
+ */
+const retryFailedDelivery = async (req, res) => {
+  const { id } = req.body;
+  const client = req.db;
+  
+  try {
+    // Validate required fields
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Notification ID is required'
+      });
+    }
+    
+    // Get the notification
+    const notificationResult = await client.query(`
+      SELECT * FROM notifications 
+      WHERE id = $1 AND user_id = $2
+    `, [id, req.user.id]);
+    
+    if (notificationResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found or you do not have permission to retry delivery'
+      });
+    }
+    
+    const notification = notificationResult.rows[0];
+    
+    // Only retry if status is 'failed' or 'pending_http'
+    if (notification.delivery_status !== 'failed' && notification.delivery_status !== 'pending_http') {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only retry delivery for notifications with status "failed" or "pending_http"'
+      });
+    }
+    
+    // Attempt to deliver via WebSocket
+    await deliverViaWebSocket(client, notification);
+    
+    // Get updated notification
+    const updatedResult = await client.query(`
+      SELECT * FROM notifications 
+      WHERE id = $1
+    `, [id]);
+    
+    res.status(200).json({
+      success: true,
+      message: 'Notification delivery retry initiated',
+      data: updatedResult.rows[0]
+    });
+  } catch (error) {
+    logger.error('Error retrying notification delivery:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error retrying notification delivery',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Poll for new notifications (fallback when WebSocket is unavailable)
+ * @route GET /api/notifications/poll
+ */
+const pollNewNotifications = async (req, res) => {
+  const client = req.db;
+  const userId = req.user.id;
+  
+  try {
+    // Check for pending notifications in memory first
+    const pendingForUser = pendingNotifications.get(userId) || [];
+    
+    // If we have pending notifications in memory, return them and clear the queue
+    if (pendingForUser.length > 0) {
+      const notifications = [...pendingForUser];
+      pendingNotifications.set(userId, []); // Clear the queue
+      
+      // Update delivery status for these notifications
+      const notificationIds = notifications.map(n => n.id);
+      await client.query(`
+        UPDATE notifications
+        SET 
+          delivery_status = 'delivered',
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ANY($1::int[])
+      `, [notificationIds]);
+      
+      return res.status(200).json({
+        success: true,
+        count: notifications.length,
+        data: notifications
+      });
+    }
+    
+    // Otherwise, check the database for pending notifications
+    const result = await client.query(`
+      SELECT * FROM notifications 
+      WHERE user_id = $1 
+      AND (delivery_status = 'pending' OR delivery_status = 'pending_http')
+      AND is_read = FALSE
+      ORDER BY created_at DESC
+      LIMIT 50
+    `, [userId]);
+    
+    // If we found notifications, update their status
+    if (result.rows.length > 0) {
+      const notificationIds = result.rows.map(n => n.id);
+      await client.query(`
+        UPDATE notifications
+        SET 
+          delivery_status = 'delivered',
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ANY($1::int[])
+      `, [notificationIds]);
+    }
+    
+    res.status(200).json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+  } catch (error) {
+    logger.error('Error polling for notifications:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error polling for notifications',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Subscribe to WebSocket notifications
+ * @route POST /api/notifications/subscribe
+ */
+const subscribeToNotifications = async (req, res) => {
+  try {
+    const webSocketService = getWebSocketService();
+    
+    if (!webSocketService) {
+      return res.status(503).json({
+        success: false,
+        message: 'WebSocket service is not available',
+        fallback: 'http_polling'
+      });
+    }
+    
+    // Return connection information
+    res.status(200).json({
+      success: true,
+      message: 'WebSocket service is available',
+      data: {
+        websocket_url: process.env.WEBSOCKET_URL || '/socket.io',
+        user_channel: `user:${req.user.id}`
+      }
+    });
+  } catch (error) {
+    logger.error('Error subscribing to notifications:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error subscribing to notifications',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Unsubscribe from WebSocket notifications
+ * @route POST /api/notifications/unsubscribe
+ */
+const unsubscribeFromNotifications = async (req, res) => {
+  try {
+    // This is mostly a client-side operation, but we can clean up any server resources
+    // associated with this user's WebSocket connections if needed
+    
+    res.status(200).json({
+      success: true,
+      message: 'Successfully unsubscribed from notifications'
+    });
+  } catch (error) {
+    logger.error('Error unsubscribing from notifications:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error unsubscribing from notifications',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -330,7 +817,7 @@ const createServiceRequestNotification = async (client, serviceRequestId, userId
     `, [serviceRequestId]);
     
     if (serviceRequestResult.rows.length === 0) {
-      console.error(`Service request ${serviceRequestId} not found for notification`);
+      logger.error(`Service request ${serviceRequestId} not found for notification`);
       return null;
     }
     
@@ -385,7 +872,7 @@ const createServiceRequestNotification = async (client, serviceRequestId, userId
         type = 'info';
     }
     
-    // Create notification
+    // Create notification with WebSocket delivery
     return await createNotification(client, {
       user_id: userId,
       title,
@@ -399,9 +886,9 @@ const createServiceRequestNotification = async (client, serviceRequestId, userId
           url: `/service-requests/${serviceRequestId}`
         }
       }
-    });
+    }, 'all'); // Use all delivery channels
   } catch (error) {
-    console.error('Error creating service request notification:', error);
+    logger.error('Error creating service request notification:', error);
     return null;
   }
 };
@@ -428,7 +915,7 @@ const createPaymentNotification = async (client, paymentId, userId, action) => {
     `, [paymentId]);
     
     if (paymentResult.rows.length === 0) {
-      console.error(`Payment ${paymentId} not found for notification`);
+      logger.error(`Payment ${paymentId} not found for notification`);
       return null;
     }
     
@@ -468,7 +955,7 @@ const createPaymentNotification = async (client, paymentId, userId, action) => {
         type = 'info';
     }
     
-    // Create notification
+    // Create notification with WebSocket delivery
     return await createNotification(client, {
       user_id: userId,
       title,
@@ -482,9 +969,9 @@ const createPaymentNotification = async (client, paymentId, userId, action) => {
           url: `/payments/${paymentId}`
         }
       }
-    });
+    }, 'all'); // Use all delivery channels
   } catch (error) {
-    console.error('Error creating payment notification:', error);
+    logger.error('Error creating payment notification:', error);
     return null;
   }
 };
@@ -496,10 +983,16 @@ module.exports = {
   deleteNotifications,
   getNotificationCount,
   getNotificationById,
+  getNotificationsByDeliveryStatus,
+  updateDeliveryStatus,
+  retryFailedDelivery,
+  pollNewNotifications,
+  subscribeToNotifications,
+  unsubscribeFromNotifications,
   
   // Export helper functions for use in other controllers
   createNotification,
   createNotificationForUsers,
   createServiceRequestNotification,
   createPaymentNotification
-}; 
+};
