@@ -1,4 +1,7 @@
 const crypto = require('crypto');
+const fileUploadService = require('../services/file-upload.service');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
 
 /**
  * Get all properties (admin only)
@@ -70,14 +73,14 @@ const getPropertyById = async (req, res) => {
     if (req.user.role !== 'admin' && 
         String(req.user.id) !== String(property.homeowner_user_id) && 
         req.user.role !== 'provider') {
-      console.log('⛔ Authorization failed: User not allowed to access this property');
+      console.log('\u26d4 Authorization failed: User not allowed to access this property');
       return res.status(403).json({
         success: false,
         message: 'Not authorized to access this property'
       });
     }
     
-    console.log('✅ Authorization successful: User has access to this property');
+    console.log('\u2705 Authorization successful: User has access to this property');
     res.status(200).json({
       success: true,
       data: property
@@ -308,7 +311,7 @@ const generateQrCode = async (req, res) => {
     
     // Check if user is authorized to generate QR code for this property
     if (req.user.role !== 'admin' && userId !== homeownerId) {
-      console.log('⛔ Authorization failed: User not allowed to generate QR code for this property');
+      console.log('\u26d4 Authorization failed: User not allowed to generate QR code for this property');
       console.log(`User ${userId} attempted to generate QR code for property owned by ${homeownerId}`);
       return res.status(403).json({
         success: false,
@@ -316,7 +319,7 @@ const generateQrCode = async (req, res) => {
       });
     }
     
-    console.log('✅ Authorization successful: User has access to generate QR code');
+    console.log('\u2705 Authorization successful: User has access to generate QR code');
     
     // Generate and store QR code
     const qrCodeUrl = await generateAndStoreQrCode(client, id);
@@ -411,6 +414,381 @@ const getPropertyByHash = async (req, res) => {
   }
 };
 
+/**
+ * Upload files for a property
+ * @route POST /api/properties/:id/files
+ */
+const uploadPropertyFiles = async (req, res) => {
+  const { id } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if property exists and belongs to this user
+    const checkResult = await client.query(`
+      SELECT p.*, h.user_id as homeowner_user_id
+      FROM properties p
+      JOIN homeowners h ON p.homeowner_id = h.id
+      WHERE p.id = $1
+    `, [id]);
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Property not found'
+      });
+    }
+    
+    const property = checkResult.rows[0];
+    
+    // Check if user is authorized to upload files for this property
+    if (req.user.role !== 'admin' && String(req.user.id) !== String(property.homeowner_user_id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to upload files for this property'
+      });
+    }
+    
+    // Check if files were uploaded
+    if (!req.file && (!req.files || req.files.length === 0)) {
+      return res.status(400).json({
+        success: false,
+        message: 'No files were uploaded'
+      });
+    }
+    
+    // Process single file upload
+    if (req.file) {
+      const fileMetadata = await processFileUpload(req.file, id, req.user.id, req.body.description || '');
+      return res.status(201).json({
+        success: true,
+        message: 'File uploaded successfully',
+        data: fileMetadata
+      });
+    }
+    
+    // Process multiple file uploads
+    const uploadPromises = req.files.map(file => {
+      return processFileUpload(file, id, req.user.id, req.body.description || '');
+    });
+    
+    const uploadedFiles = await Promise.all(uploadPromises);
+    
+    res.status(201).json({
+      success: true,
+      message: 'Files uploaded successfully',
+      data: uploadedFiles
+    });
+  } catch (error) {
+    console.error('Error uploading property files:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error uploading files',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Helper function to process file upload and save metadata to database
+ */
+const processFileUpload = async (file, propertyId, userId, description) => {
+  // Upload file to S3 using the file upload service
+  const fileMetadata = await fileUploadService.uploadFile(file, {
+    entityType: 'property',
+    entityId: propertyId,
+    description
+  });
+  
+  // Save file metadata to database
+  const client = global.dbClient; // Access the global DB client
+  const result = await client.query(`
+    INSERT INTO file_uploads 
+      (user_id, related_to, related_id, file_url, metadata)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING id
+  `, [
+    userId,
+    'PROPERTY',
+    propertyId,
+    fileMetadata.location,
+    JSON.stringify({
+      originalFilename: fileMetadata.originalFilename,
+      mimeType: fileMetadata.mimeType,
+      size: fileMetadata.size,
+      key: fileMetadata.key,
+      bucket: fileMetadata.bucket,
+      description
+    })
+  ]);
+  
+  // Return combined metadata
+  return {
+    id: result.rows[0].id,
+    ...fileMetadata,
+    description
+  };
+};
+
+/**
+ * Get files for a property
+ * @route GET /api/properties/:id/files
+ */
+const getPropertyFiles = async (req, res) => {
+  const { id } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if property exists and user has access
+    const checkResult = await client.query(`
+      SELECT p.*, h.user_id as homeowner_user_id
+      FROM properties p
+      JOIN homeowners h ON p.homeowner_id = h.id
+      WHERE p.id = $1
+    `, [id]);
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Property not found'
+      });
+    }
+    
+    const property = checkResult.rows[0];
+    
+    // Check if user is authorized to access this property's files
+    if (req.user.role !== 'admin' && 
+        String(req.user.id) !== String(property.homeowner_user_id) && 
+        req.user.role !== 'provider') {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to access files for this property'
+      });
+    }
+    
+    // Get files from database
+    const filesResult = await client.query(`
+      SELECT f.*, u.first_name, u.last_name 
+      FROM file_uploads f
+      JOIN users u ON f.user_id = u.id
+      WHERE f.related_to = 'PROPERTY' AND f.related_id = $1
+      ORDER BY f.created_at DESC
+    `, [id]);
+    
+    // Generate pre-signed URLs for each file if needed
+    const files = await Promise.all(filesResult.rows.map(async (file) => {
+      const metadata = file.metadata || {};
+      let fileUrl = file.file_url;
+      
+      // Generate a pre-signed URL if the file is stored in S3
+      if (metadata.key && metadata.bucket) {
+        try {
+          fileUrl = await fileUploadService.generatePresignedUrl(metadata.key, {
+            operation: 'getObject',
+            expiresIn: 3600, // 1 hour
+            user: req.user
+          });
+        } catch (error) {
+          console.error('Error generating pre-signed URL:', error);
+          // Continue with the original URL if pre-signed URL generation fails
+        }
+      }
+      
+      return {
+        id: file.id,
+        fileName: metadata.originalFilename || 'Unknown',
+        fileType: metadata.mimeType || 'application/octet-stream',
+        fileSize: metadata.size || 0,
+        description: metadata.description || '',
+        uploadedBy: `${file.first_name} ${file.last_name}`,
+        uploadedAt: file.created_at,
+        url: fileUrl
+      };
+    }));
+    
+    res.status(200).json({
+      success: true,
+      count: files.length,
+      data: files
+    });
+  } catch (error) {
+    console.error('Error getting property files:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching property files',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Delete a property file
+ * @route DELETE /api/properties/:propertyId/files/:fileId
+ */
+const deletePropertyFile = async (req, res) => {
+  const { propertyId, fileId } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if property exists and user has access
+    const checkResult = await client.query(`
+      SELECT p.*, h.user_id as homeowner_user_id
+      FROM properties p
+      JOIN homeowners h ON p.homeowner_id = h.id
+      WHERE p.id = $1
+    `, [propertyId]);
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Property not found'
+      });
+    }
+    
+    const property = checkResult.rows[0];
+    
+    // Check if user is authorized to delete files for this property
+    if (req.user.role !== 'admin' && String(req.user.id) !== String(property.homeowner_user_id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to delete files for this property'
+      });
+    }
+    
+    // Get file information
+    const fileResult = await client.query(`
+      SELECT * FROM file_uploads
+      WHERE id = $1 AND related_to = 'PROPERTY' AND related_id = $2
+    `, [fileId, propertyId]);
+    
+    if (fileResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'File not found'
+      });
+    }
+    
+    const file = fileResult.rows[0];
+    const metadata = file.metadata || {};
+    
+    // Delete file from S3 if key exists
+    if (metadata.key) {
+      try {
+        await fileUploadService.deleteFile(metadata.key, req.user);
+      } catch (error) {
+        console.error('Error deleting file from S3:', error);
+        // Continue with database deletion even if S3 deletion fails
+      }
+    }
+    
+    // Delete file record from database
+    await client.query('DELETE FROM file_uploads WHERE id = $1', [fileId]);
+    
+    res.status(200).json({
+      success: true,
+      message: 'File deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting property file:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting file',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get a single property file with pre-signed URL
+ * @route GET /api/properties/:propertyId/files/:fileId
+ */
+const getPropertyFile = async (req, res) => {
+  const { propertyId, fileId } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if property exists and user has access
+    const checkResult = await client.query(`
+      SELECT p.*, h.user_id as homeowner_user_id
+      FROM properties p
+      JOIN homeowners h ON p.homeowner_id = h.id
+      WHERE p.id = $1
+    `, [propertyId]);
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Property not found'
+      });
+    }
+    
+    const property = checkResult.rows[0];
+    
+    // Check if user is authorized to access this property's files
+    if (req.user.role !== 'admin' && 
+        String(req.user.id) !== String(property.homeowner_user_id) && 
+        req.user.role !== 'provider') {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to access files for this property'
+      });
+    }
+    
+    // Get file information
+    const fileResult = await client.query(`
+      SELECT f.*, u.first_name, u.last_name 
+      FROM file_uploads f
+      JOIN users u ON f.user_id = u.id
+      WHERE f.id = $1 AND f.related_to = 'PROPERTY' AND f.related_id = $2
+    `, [fileId, propertyId]);
+    
+    if (fileResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'File not found'
+      });
+    }
+    
+    const file = fileResult.rows[0];
+    const metadata = file.metadata || {};
+    let fileUrl = file.file_url;
+    
+    // Generate a pre-signed URL if the file is stored in S3
+    if (metadata.key && metadata.bucket) {
+      try {
+        fileUrl = await fileUploadService.generatePresignedUrl(metadata.key, {
+          operation: 'getObject',
+          expiresIn: 3600, // 1 hour
+          user: req.user
+        });
+      } catch (error) {
+        console.error('Error generating pre-signed URL:', error);
+        // Continue with the original URL if pre-signed URL generation fails
+      }
+    }
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        id: file.id,
+        fileName: metadata.originalFilename || 'Unknown',
+        fileType: metadata.mimeType || 'application/octet-stream',
+        fileSize: metadata.size || 0,
+        description: metadata.description || '',
+        uploadedBy: `${file.first_name} ${file.last_name}`,
+        uploadedAt: file.created_at,
+        url: fileUrl
+      }
+    });
+  } catch (error) {
+    console.error('Error getting property file:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching file',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
 module.exports = {
   getAllProperties,
   getPropertyById,
@@ -418,5 +796,9 @@ module.exports = {
   updateProperty,
   deleteProperty,
   generateQrCode,
-  getPropertyByHash
+  getPropertyByHash,
+  uploadPropertyFiles,
+  getPropertyFiles,
+  getPropertyFile,
+  deletePropertyFile
 }; 
