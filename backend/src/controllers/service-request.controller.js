@@ -6,6 +6,9 @@
 // Import the notification helper functions
 const { createServiceRequestNotification } = require('./notification.controller');
 
+// Import the file upload service
+const fileUploadService = require('../services/file-upload.service');
+
 /**
  * Get all service requests (filtered by query params)
  * @route GET /api/service-requests
@@ -20,7 +23,8 @@ const getAllServiceRequests = async (req, res) => {
       SELECT sr.*, 
         s.name as service_name, s.category as service_category,
         p.address as property_address,
-        u.first_name as homeowner_first_name, u.last_name as homeowner_last_name
+        u.first_name as homeowner_first_name, u.last_name as homeowner_last_name,
+        sr.attachment_ids
       FROM service_requests sr
       JOIN services s ON sr.service_id = s.id
       JOIN properties p ON sr.property_id = p.id
@@ -112,10 +116,24 @@ const getAllServiceRequests = async (req, res) => {
     
     const result = await client.query(query, queryParams);
     
+    // Process attachment_ids for each service request
+    const processedResults = result.rows.map(row => {
+      // Parse attachment_ids if it exists and is a string
+      if (row.attachment_ids && typeof row.attachment_ids === 'string') {
+        try {
+          row.attachment_ids = JSON.parse(row.attachment_ids);
+        } catch (e) {
+          // If parsing fails, keep as is
+          console.error('Error parsing attachment_ids:', e);
+        }
+      }
+      return row;
+    });
+    
     res.status(200).json({
       success: true,
-      count: result.rows.length,
-      data: result.rows
+      count: processedResults.length,
+      data: processedResults
     });
   } catch (error) {
     console.error('Error getting service requests:', error);
@@ -227,6 +245,34 @@ const getServiceRequestById = async (req, res) => {
       serviceRequest.bids = bidsResult.rows;
     }
     
+    // Get file attachments if any
+    if (serviceRequest.attachment_ids) {
+      try {
+        // Parse attachment_ids if it's a string
+        const attachmentIds = typeof serviceRequest.attachment_ids === 'string' 
+          ? JSON.parse(serviceRequest.attachment_ids) 
+          : serviceRequest.attachment_ids;
+        
+        if (attachmentIds && attachmentIds.length > 0) {
+          // Get file metadata from file_uploads table
+          const attachmentsResult = await client.query(`
+            SELECT id, file_url, metadata, created_at
+            FROM file_uploads
+            WHERE id = ANY($1) AND related_to = 'SERVICE_REQUEST' AND related_id = $2
+          `, [attachmentIds, id]);
+          
+          serviceRequest.attachments = attachmentsResult.rows;
+        } else {
+          serviceRequest.attachments = [];
+        }
+      } catch (error) {
+        console.error('Error processing attachment_ids:', error);
+        serviceRequest.attachments = [];
+      }
+    } else {
+      serviceRequest.attachments = [];
+    }
+    
     res.status(200).json({
       success: true,
       data: serviceRequest
@@ -252,7 +298,8 @@ const createServiceRequest = async (req, res) => {
     description, 
     preferred_date, 
     is_recurring, 
-    recurrence_frequency 
+    recurrence_frequency,
+    attachment_ids // Optional array of file IDs that were previously uploaded
   } = req.body;
   const client = req.db;
   
@@ -306,11 +353,34 @@ const createServiceRequest = async (req, res) => {
       });
     }
     
+    // Verify attachment_ids if provided
+    let validatedAttachmentIds = [];
+    if (attachment_ids && attachment_ids.length > 0) {
+      // Check if all attachment_ids exist and belong to this user
+      const attachmentCheck = await client.query(
+        'SELECT id FROM file_uploads WHERE id = ANY($1) AND user_id = $2',
+        [attachment_ids, req.user.id]
+      );
+      
+      validatedAttachmentIds = attachmentCheck.rows.map(row => row.id);
+      
+      // If not all attachment_ids were found, return an error
+      if (validatedAttachmentIds.length !== attachment_ids.length) {
+        return res.status(400).json({
+          success: false,
+          message: 'One or more attachment IDs are invalid or do not belong to this user'
+        });
+      }
+    }
+    
+    // Start a transaction
+    await client.query('BEGIN');
+    
     // Create the service request
     const result = await client.query(`
       INSERT INTO service_requests
-        (homeowner_id, property_id, service_id, status, description, preferred_date, is_recurring, recurrence_frequency)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        (homeowner_id, property_id, service_id, status, description, preferred_date, is_recurring, recurrence_frequency, attachment_ids)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *
     `, [
       homeownerId, 
@@ -320,8 +390,23 @@ const createServiceRequest = async (req, res) => {
       description,
       preferred_date,
       is_recurring || false,
-      recurrence_frequency
+      recurrence_frequency,
+      validatedAttachmentIds.length > 0 ? JSON.stringify(validatedAttachmentIds) : null
     ]);
+    
+    const serviceRequestId = result.rows[0].id;
+    
+    // Update file_uploads records to link them to this service request
+    if (validatedAttachmentIds.length > 0) {
+      await client.query(`
+        UPDATE file_uploads
+        SET related_to = 'SERVICE_REQUEST', related_id = $1
+        WHERE id = ANY($2)
+      `, [serviceRequestId, validatedAttachmentIds]);
+    }
+    
+    // Commit the transaction
+    await client.query('COMMIT');
     
     // Get additional information to return
     const enhancedResult = await client.query(`
@@ -332,14 +417,35 @@ const createServiceRequest = async (req, res) => {
       JOIN services s ON sr.service_id = s.id
       JOIN properties p ON sr.property_id = p.id
       WHERE sr.id = $1
-    `, [result.rows[0].id]);
+    `, [serviceRequestId]);
+    
+    // Get file metadata if attachments were provided
+    let attachments = [];
+    if (validatedAttachmentIds.length > 0) {
+      const attachmentsResult = await client.query(`
+        SELECT id, file_url, metadata, created_at
+        FROM file_uploads
+        WHERE id = ANY($1)
+      `, [validatedAttachmentIds]);
+      
+      attachments = attachmentsResult.rows;
+    }
+    
+    // Add attachments to the response
+    const responseData = {
+      ...enhancedResult.rows[0],
+      attachments
+    };
     
     res.status(201).json({
       success: true,
       message: 'Service request created successfully',
-      data: enhancedResult.rows[0]
+      data: responseData
     });
   } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
     console.error('Error creating service request:', error);
     res.status(500).json({
       success: false,
@@ -359,7 +465,8 @@ const updateServiceRequest = async (req, res) => {
     description, 
     preferred_date, 
     is_recurring, 
-    recurrence_frequency 
+    recurrence_frequency,
+    attachment_ids // Optional array of file IDs to update attachments
   } = req.body;
   const client = req.db;
   
@@ -397,25 +504,142 @@ const updateServiceRequest = async (req, res) => {
       });
     }
     
-    // Update the service request
-    const result = await client.query(`
-      UPDATE service_requests
-      SET 
-        description = COALESCE($1, description),
-        preferred_date = COALESCE($2, preferred_date),
-        is_recurring = COALESCE($3, is_recurring),
-        recurrence_frequency = COALESCE($4, recurrence_frequency),
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $5
-      RETURNING *
-    `, [description, preferred_date, is_recurring, recurrence_frequency, id]);
+    // Verify attachment_ids if provided
+    let validatedAttachmentIds = null;
+    if (attachment_ids !== undefined) {
+      if (Array.isArray(attachment_ids) && attachment_ids.length > 0) {
+        // Check if all attachment_ids exist and belong to this user
+        const attachmentCheck = await client.query(
+          'SELECT id FROM file_uploads WHERE id = ANY($1) AND user_id = $2',
+          [attachment_ids, req.user.id]
+        );
+        
+        validatedAttachmentIds = attachmentCheck.rows.map(row => row.id);
+        
+        // If not all attachment_ids were found, return an error
+        if (validatedAttachmentIds.length !== attachment_ids.length) {
+          return res.status(400).json({
+            success: false,
+            message: 'One or more attachment IDs are invalid or do not belong to this user'
+          });
+        }
+      } else if (Array.isArray(attachment_ids) && attachment_ids.length === 0) {
+        // Empty array means remove all attachments
+        validatedAttachmentIds = [];
+      }
+    }
     
-    res.status(200).json({
-      success: true,
-      message: 'Service request updated successfully',
-      data: result.rows[0]
-    });
+    // Start a transaction
+    await client.query('BEGIN');
+    
+    // Update the service request
+    const updateFields = [];
+    const updateValues = [];
+    let paramIndex = 1;
+    
+    if (description !== undefined) {
+      updateFields.push(`description = $${paramIndex}`);
+      updateValues.push(description);
+      paramIndex++;
+    }
+    
+    if (preferred_date !== undefined) {
+      updateFields.push(`preferred_date = $${paramIndex}`);
+      updateValues.push(preferred_date);
+      paramIndex++;
+    }
+    
+    if (is_recurring !== undefined) {
+      updateFields.push(`is_recurring = $${paramIndex}`);
+      updateValues.push(is_recurring);
+      paramIndex++;
+    }
+    
+    if (recurrence_frequency !== undefined) {
+      updateFields.push(`recurrence_frequency = $${paramIndex}`);
+      updateValues.push(recurrence_frequency);
+      paramIndex++;
+    }
+    
+    if (validatedAttachmentIds !== null) {
+      updateFields.push(`attachment_ids = $${paramIndex}`);
+      updateValues.push(validatedAttachmentIds.length > 0 ? JSON.stringify(validatedAttachmentIds) : null);
+      paramIndex++;
+    }
+    
+    updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
+    
+    // Only proceed if there are fields to update
+    if (updateFields.length > 0) {
+      const updateQuery = `
+        UPDATE service_requests
+        SET ${updateFields.join(', ')}
+        WHERE id = $${paramIndex}
+        RETURNING *
+      `;
+      
+      updateValues.push(id);
+      
+      const result = await client.query(updateQuery, updateValues);
+      
+      // Update file_uploads records if attachment_ids were provided
+      if (validatedAttachmentIds !== null) {
+        // First, reset any existing attachments for this service request
+        await client.query(`
+          UPDATE file_uploads
+          SET related_to = NULL, related_id = NULL
+          WHERE related_to = 'SERVICE_REQUEST' AND related_id = $1
+        `, [id]);
+        
+        // Then, link the new attachments to this service request
+        if (validatedAttachmentIds.length > 0) {
+          await client.query(`
+            UPDATE file_uploads
+            SET related_to = 'SERVICE_REQUEST', related_id = $1
+            WHERE id = ANY($2)
+          `, [id, validatedAttachmentIds]);
+        }
+      }
+      
+      // Commit the transaction
+      await client.query('COMMIT');
+      
+      // Get file metadata if attachments were updated
+      let attachments = [];
+      if (validatedAttachmentIds !== null && validatedAttachmentIds.length > 0) {
+        const attachmentsResult = await client.query(`
+          SELECT id, file_url, metadata, created_at
+          FROM file_uploads
+          WHERE id = ANY($1)
+        `, [validatedAttachmentIds]);
+        
+        attachments = attachmentsResult.rows;
+      }
+      
+      // Add attachments to the response
+      const responseData = {
+        ...result.rows[0],
+        attachments
+      };
+      
+      res.status(200).json({
+        success: true,
+        message: 'Service request updated successfully',
+        data: responseData
+      });
+    } else {
+      // No fields to update
+      await client.query('ROLLBACK');
+      
+      res.status(400).json({
+        success: false,
+        message: 'No fields provided for update'
+      });
+    }
   } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
     console.error('Error updating service request:', error);
     res.status(500).json({
       success: false,
@@ -469,6 +693,27 @@ const deleteServiceRequest = async (req, res) => {
     
     // Start a transaction
     await client.query('BEGIN');
+    
+    // Get attachment IDs before deleting
+    let attachmentIds = [];
+    if (serviceRequest.attachment_ids) {
+      try {
+        attachmentIds = typeof serviceRequest.attachment_ids === 'string' 
+          ? JSON.parse(serviceRequest.attachment_ids) 
+          : serviceRequest.attachment_ids;
+      } catch (error) {
+        console.error('Error parsing attachment_ids:', error);
+      }
+    }
+    
+    // Update file_uploads to remove the relationship with this service request
+    if (attachmentIds.length > 0) {
+      await client.query(`
+        UPDATE file_uploads
+        SET related_to = NULL, related_id = NULL
+        WHERE id = ANY($1) AND related_to = 'SERVICE_REQUEST' AND related_id = $2
+      `, [attachmentIds, id]);
+    }
     
     // Delete any bids associated with this service request
     await client.query('DELETE FROM bids WHERE service_request_id = $1', [id]);
@@ -917,6 +1162,609 @@ const submitBid = async (req, res) => {
 };
 
 /**
+ * Upload a file attachment for a service request
+ * @route POST /api/service-requests/:id/attachments
+ */
+const uploadServiceRequestAttachment = async (req, res) => {
+  const { id } = req.params;
+  const { description } = req.body;
+  const client = req.db;
+  
+  // Check if file was provided
+  if (!req.file) {
+    return res.status(400).json({
+      success: false,
+      message: 'No file uploaded'
+    });
+  }
+  
+  try {
+    // Check if service request exists and belongs to this user
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Check authorization - only homeowner who owns this request, assigned provider, or admin can upload
+    let isAuthorized = false;
+    
+    if (req.user.role === 'admin') {
+      isAuthorized = true;
+    } else if (req.user.role === 'homeowner' && req.user.id === parseInt(serviceRequest.homeowner_user_id)) {
+      isAuthorized = true;
+    } else if (req.user.role === 'provider') {
+      // Check if provider has an accepted bid for this service request
+      const providerId = await getProviderIdFromUserId(client, req.user.id);
+      
+      if (providerId) {
+        const bidCheck = await client.query(
+          'SELECT id FROM bids WHERE service_request_id = $1 AND provider_id = $2 AND status = $3',
+          [id, providerId, 'accepted']
+        );
+        
+        if (bidCheck.rows.length > 0) {
+          isAuthorized = true;
+        }
+      }
+    }
+    
+    if (!isAuthorized) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to upload attachments to this service request'
+      });
+    }
+    
+    // Upload file to storage service
+    const fileMetadata = await fileUploadService.uploadFile(req.file, {
+      entityType: 'service-request',
+      entityId: id,
+      description: description || ''
+    });
+    
+    // Start a transaction
+    await client.query('BEGIN');
+    
+    // Store file metadata in database
+    const fileUploadResult = await client.query(`
+      INSERT INTO file_uploads
+        (user_id, related_to, related_id, file_url, metadata)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, file_url, metadata, created_at
+    `, [
+      req.user.id,
+      'SERVICE_REQUEST',
+      id,
+      fileMetadata.location,
+      JSON.stringify({
+        originalFilename: fileMetadata.originalFilename,
+        mimeType: fileMetadata.mimeType,
+        size: fileMetadata.size,
+        description: description || ''
+      })
+    ]);
+    
+    const fileUpload = fileUploadResult.rows[0];
+    
+    // Update service_requests.attachment_ids to include this new file
+    let attachmentIds = [];
+    if (serviceRequest.attachment_ids) {
+      try {
+        attachmentIds = typeof serviceRequest.attachment_ids === 'string' 
+          ? JSON.parse(serviceRequest.attachment_ids) 
+          : serviceRequest.attachment_ids;
+      } catch (error) {
+        console.error('Error parsing attachment_ids:', error);
+      }
+    }
+    
+    // Add the new file ID to the array
+    attachmentIds.push(fileUpload.id);
+    
+    // Update the service request with the new attachment_ids
+    await client.query(`
+      UPDATE service_requests
+      SET attachment_ids = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+    `, [JSON.stringify(attachmentIds), id]);
+    
+    // Commit the transaction
+    await client.query('COMMIT');
+    
+    res.status(201).json({
+      success: true,
+      message: 'File uploaded successfully',
+      data: fileUpload
+    });
+  } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
+    console.error('Error uploading file:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error uploading file',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Upload multiple file attachments for a service request
+ * @route POST /api/service-requests/:id/attachments/batch
+ */
+const uploadMultipleServiceRequestAttachments = async (req, res) => {
+  const { id } = req.params;
+  const client = req.db;
+  
+  // Check if files were provided
+  if (!req.files || req.files.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: 'No files uploaded'
+    });
+  }
+  
+  try {
+    // Check if service request exists and belongs to this user
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Check authorization - only homeowner who owns this request, assigned provider, or admin can upload
+    let isAuthorized = false;
+    
+    if (req.user.role === 'admin') {
+      isAuthorized = true;
+    } else if (req.user.role === 'homeowner' && req.user.id === parseInt(serviceRequest.homeowner_user_id)) {
+      isAuthorized = true;
+    } else if (req.user.role === 'provider') {
+      // Check if provider has an accepted bid for this service request
+      const providerId = await getProviderIdFromUserId(client, req.user.id);
+      
+      if (providerId) {
+        const bidCheck = await client.query(
+          'SELECT id FROM bids WHERE service_request_id = $1 AND provider_id = $2 AND status = $3',
+          [id, providerId, 'accepted']
+        );
+        
+        if (bidCheck.rows.length > 0) {
+          isAuthorized = true;
+        }
+      }
+    }
+    
+    if (!isAuthorized) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to upload attachments to this service request'
+      });
+    }
+    
+    // Start a transaction
+    await client.query('BEGIN');
+    
+    // Get current attachment IDs
+    let attachmentIds = [];
+    if (serviceRequest.attachment_ids) {
+      try {
+        attachmentIds = typeof serviceRequest.attachment_ids === 'string' 
+          ? JSON.parse(serviceRequest.attachment_ids) 
+          : serviceRequest.attachment_ids;
+      } catch (error) {
+        console.error('Error parsing attachment_ids:', error);
+      }
+    }
+    
+    // Upload each file and store metadata
+    const uploadedFiles = [];
+    
+    for (const file of req.files) {
+      // Upload file to storage service
+      const fileMetadata = await fileUploadService.uploadFile(file, {
+        entityType: 'service-request',
+        entityId: id,
+        description: ''
+      });
+      
+      // Store file metadata in database
+      const fileUploadResult = await client.query(`
+        INSERT INTO file_uploads
+          (user_id, related_to, related_id, file_url, metadata)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, file_url, metadata, created_at
+      `, [
+        req.user.id,
+        'SERVICE_REQUEST',
+        id,
+        fileMetadata.location,
+        JSON.stringify({
+          originalFilename: fileMetadata.originalFilename,
+          mimeType: fileMetadata.mimeType,
+          size: fileMetadata.size,
+          description: ''
+        })
+      ]);
+      
+      const fileUpload = fileUploadResult.rows[0];
+      uploadedFiles.push(fileUpload);
+      
+      // Add the new file ID to the array
+      attachmentIds.push(fileUpload.id);
+    }
+    
+    // Update the service request with the new attachment_ids
+    await client.query(`
+      UPDATE service_requests
+      SET attachment_ids = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+    `, [JSON.stringify(attachmentIds), id]);
+    
+    // Commit the transaction
+    await client.query('COMMIT');
+    
+    res.status(201).json({
+      success: true,
+      message: `${uploadedFiles.length} files uploaded successfully`,
+      data: uploadedFiles
+    });
+  } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
+    console.error('Error uploading files:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error uploading files',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get all attachments for a service request
+ * @route GET /api/service-requests/:id/attachments
+ */
+const getServiceRequestAttachments = async (req, res) => {
+  const { id } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if service request exists
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Check authorization
+    let isAuthorized = false;
+    
+    if (req.user.role === 'admin') {
+      isAuthorized = true;
+    } else if (req.user.role === 'homeowner' && req.user.id === parseInt(serviceRequest.homeowner_user_id)) {
+      isAuthorized = true;
+    } else if (req.user.role === 'provider') {
+      // Check if provider has a bid for this service request
+      const providerId = await getProviderIdFromUserId(client, req.user.id);
+      
+      if (providerId) {
+        const bidCheck = await client.query(
+          'SELECT id FROM bids WHERE service_request_id = $1 AND provider_id = $2',
+          [id, providerId]
+        );
+        
+        if (bidCheck.rows.length > 0) {
+          isAuthorized = true;
+        }
+      }
+    }
+    
+    if (!isAuthorized) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to view attachments for this service request'
+      });
+    }
+    
+    // Get attachment IDs
+    let attachmentIds = [];
+    if (serviceRequest.attachment_ids) {
+      try {
+        attachmentIds = typeof serviceRequest.attachment_ids === 'string' 
+          ? JSON.parse(serviceRequest.attachment_ids) 
+          : serviceRequest.attachment_ids;
+      } catch (error) {
+        console.error('Error parsing attachment_ids:', error);
+      }
+    }
+    
+    // Get file metadata from file_uploads table
+    let attachments = [];
+    if (attachmentIds.length > 0) {
+      const attachmentsResult = await client.query(`
+        SELECT id, user_id, file_url, metadata, created_at
+        FROM file_uploads
+        WHERE id = ANY($1) AND related_to = 'SERVICE_REQUEST' AND related_id = $2
+      `, [attachmentIds, id]);
+      
+      attachments = attachmentsResult.rows.map(row => {
+        // Parse metadata if it's a string
+        if (row.metadata && typeof row.metadata === 'string') {
+          try {
+            row.metadata = JSON.parse(row.metadata);
+          } catch (e) {
+            // If parsing fails, keep as is
+            console.error('Error parsing metadata:', e);
+          }
+        }
+        return row;
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      count: attachments.length,
+      data: attachments
+    });
+  } catch (error) {
+    console.error('Error getting attachments:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching attachments',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Delete a file attachment from a service request
+ * @route DELETE /api/service-requests/:id/attachments/:fileId
+ */
+const deleteServiceRequestAttachment = async (req, res) => {
+  const { id, fileId } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if service request exists and belongs to this user
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Check authorization - only homeowner who owns this request or admin can delete attachments
+    if (req.user.role !== 'admin' && req.user.id !== parseInt(serviceRequest.homeowner_user_id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to delete attachments from this service request'
+      });
+    }
+    
+    // Check if file exists and belongs to this service request
+    const fileCheck = await client.query(`
+      SELECT id, file_url
+      FROM file_uploads
+      WHERE id = $1 AND related_to = 'SERVICE_REQUEST' AND related_id = $2
+    `, [fileId, id]);
+    
+    if (fileCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'File not found or does not belong to this service request'
+      });
+    }
+    
+    const file = fileCheck.rows[0];
+    
+    // Start a transaction
+    await client.query('BEGIN');
+    
+    // Get current attachment IDs
+    let attachmentIds = [];
+    if (serviceRequest.attachment_ids) {
+      try {
+        attachmentIds = typeof serviceRequest.attachment_ids === 'string' 
+          ? JSON.parse(serviceRequest.attachment_ids) 
+          : serviceRequest.attachment_ids;
+      } catch (error) {
+        console.error('Error parsing attachment_ids:', error);
+      }
+    }
+    
+    // Remove the file ID from the array
+    attachmentIds = attachmentIds.filter(id => id !== parseInt(fileId));
+    
+    // Update the service request with the new attachment_ids
+    await client.query(`
+      UPDATE service_requests
+      SET attachment_ids = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+    `, [JSON.stringify(attachmentIds), id]);
+    
+    // Update the file_uploads record to remove the relationship
+    await client.query(`
+      UPDATE file_uploads
+      SET related_to = NULL, related_id = NULL
+      WHERE id = $1
+    `, [fileId]);
+    
+    // Try to delete the file from storage
+    try {
+      // Extract the key from the file URL
+      const urlParts = file.file_url.split('/');
+      const key = urlParts.slice(3).join('/'); // Skip protocol and domain
+      
+      await fileUploadService.deleteFile(key, req.user);
+    } catch (error) {
+      console.error('Error deleting file from storage:', error);
+      // Continue with the transaction even if file deletion fails
+    }
+    
+    // Commit the transaction
+    await client.query('COMMIT');
+    
+    res.status(200).json({
+      success: true,
+      message: 'File deleted successfully'
+    });
+  } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
+    console.error('Error deleting file:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting file',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get a pre-signed URL for a specific attachment
+ * @route GET /api/service-requests/:id/attachments/:fileId/url
+ */
+const getAttachmentPresignedUrl = async (req, res) => {
+  const { id, fileId } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if service request exists
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Check authorization
+    let isAuthorized = false;
+    
+    if (req.user.role === 'admin') {
+      isAuthorized = true;
+    } else if (req.user.role === 'homeowner' && req.user.id === parseInt(serviceRequest.homeowner_user_id)) {
+      isAuthorized = true;
+    } else if (req.user.role === 'provider') {
+      // Check if provider has a bid for this service request
+      const providerId = await getProviderIdFromUserId(client, req.user.id);
+      
+      if (providerId) {
+        const bidCheck = await client.query(
+          'SELECT id FROM bids WHERE service_request_id = $1 AND provider_id = $2',
+          [id, providerId]
+        );
+        
+        if (bidCheck.rows.length > 0) {
+          isAuthorized = true;
+        }
+      }
+    }
+    
+    if (!isAuthorized) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to access attachments for this service request'
+      });
+    }
+    
+    // Check if file exists and belongs to this service request
+    const fileCheck = await client.query(`
+      SELECT id, file_url
+      FROM file_uploads
+      WHERE id = $1 AND related_to = 'SERVICE_REQUEST' AND related_id = $2
+    `, [fileId, id]);
+    
+    if (fileCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'File not found or does not belong to this service request'
+      });
+    }
+    
+    const file = fileCheck.rows[0];
+    
+    // Extract the key from the file URL
+    const urlParts = file.file_url.split('/');
+    const key = urlParts.slice(3).join('/'); // Skip protocol and domain
+    
+    // Generate a pre-signed URL
+    const presignedUrl = await fileUploadService.generatePresignedUrl(key, {
+      operation: 'getObject',
+      expiresIn: 3600, // 1 hour
+      user: req.user
+    });
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        url: presignedUrl,
+        expires_in: 3600 // 1 hour in seconds
+      }
+    });
+  } catch (error) {
+    console.error('Error generating pre-signed URL:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating pre-signed URL',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
  * Helper function to get provider ID from user ID
  */
 const getProviderIdFromUserId = async (client, userId) => {
@@ -978,5 +1826,10 @@ module.exports = {
   deleteServiceRequest,
   updateServiceRequestStatus,
   getServiceRequestBids,
-  submitBid
+  submitBid,
+  uploadServiceRequestAttachment,
+  uploadMultipleServiceRequestAttachments,
+  getServiceRequestAttachments,
+  deleteServiceRequestAttachment,
+  getAttachmentPresignedUrl
 }; 
