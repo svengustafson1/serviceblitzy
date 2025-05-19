@@ -1,4 +1,4 @@
--- Admin audit logs table for tracking all administrative actions for security and compliance purposes
+-- Admin audit logs table for tracking all administrative actions for security and compliance
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
   id SERIAL PRIMARY KEY,
   admin_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -20,7 +20,7 @@ RETURNS TRIGGER AS $$
 DECLARE
   retention_days INTEGER;
 BEGIN
-  -- Get retention days from environment variable or use default (90 days)
+  -- Get retention period from environment variable or use default (90 days)
   BEGIN
     retention_days := current_setting('app.admin_audit_retention_days')::INTEGER;
   EXCEPTION WHEN OTHERS THEN
@@ -29,7 +29,7 @@ BEGIN
   
   -- Delete audit logs older than the retention period
   DELETE FROM admin_audit_logs
-  WHERE timestamp < NOW() - (retention_days * INTERVAL '1 day');
+  WHERE timestamp < NOW() - (retention_days || ' days')::INTERVAL;
   
   RETURN NULL;
 END;
@@ -47,6 +47,3 @@ BEGIN
   EXECUTE FUNCTION purge_old_admin_audit_logs();
 END;
 $$;
-
--- Comment explaining the retention policy
-COMMENT ON TABLE admin_audit_logs IS 'Tracks all administrative actions for security and compliance purposes. Retention period configurable via ADMIN_AUDIT_RETENTION_DAYS environment variable (default: 90 days).';
