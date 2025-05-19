@@ -6,6 +6,9 @@
 // Import notification helper functions
 const { createServiceRequestNotification } = require('./notification.controller');
 
+// Import AI recommendation service
+const aiRecommendationService = require('../services/ai-recommendation.service');
+
 /**
  * Get all bids placed by a provider
  * @route GET /api/bids
@@ -73,7 +76,7 @@ const getProviderBids = async (req, res) => {
  * @route GET /api/bids/received
  */
 const getHomeownerReceivedBids = async (req, res) => {
-  const { status, service_request_id } = req.query;
+  const { status, service_request_id, sort_by } = req.query;
   const client = req.db;
   
   try {
@@ -126,8 +129,12 @@ const getHomeownerReceivedBids = async (req, res) => {
       paramIndex++;
     }
     
-    // Order by price (lowest first) and then created_at (newest first)
-    query += ` ORDER BY b.price ASC, b.created_at DESC`;
+    // Order by recommendation score (if specified), otherwise by price and created_at
+    if (sort_by === 'recommendation') {
+      query += ` ORDER BY b.recommendation_score DESC NULLS LAST, b.price ASC, b.created_at DESC`;
+    } else {
+      query += ` ORDER BY b.price ASC, b.created_at DESC`;
+    }
     
     const result = await client.query(query, queryParams);
     
@@ -293,10 +300,67 @@ const updateBid = async (req, res) => {
       RETURNING *
     `, [price, estimated_hours, description, id]);
     
+    // Get the updated bid for AI recommendation processing
+    const updatedBid = result.rows[0];
+    
+    // Get service request details
+    const serviceRequestResult = await client.query(
+      'SELECT * FROM service_requests WHERE id = $1',
+      [updatedBid.service_request_id]
+    );
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    // Get other bids for this service request
+    const otherBidsResult = await client.query(
+      'SELECT * FROM bids WHERE service_request_id = $1 AND id != $2',
+      [updatedBid.service_request_id, updatedBid.id]
+    );
+    
+    // Generate AI recommendation
+    if (serviceRequestResult.rows.length > 0 && providerResult.rows.length > 0) {
+      try {
+        const recommendation = await aiRecommendationService.generateRecommendation(
+          updatedBid,
+          serviceRequestResult.rows[0],
+          providerResult.rows[0],
+          otherBidsResult.rows
+        );
+        
+        // Update bid with recommendation data
+        await client.query(`
+          UPDATE bids
+          SET 
+            ai_recommended = $1,
+            recommendation_score = $2,
+            recommendation_confidence = $3
+          WHERE id = $4
+        `, [
+          recommendation.score > 0.7, // Flag as recommended if score is high
+          recommendation.score,
+          recommendation.confidence,
+          updatedBid.id
+        ]);
+        
+        // Add recommendation data to the result
+        updatedBid.ai_recommended = recommendation.score > 0.7;
+        updatedBid.recommendation_score = recommendation.score;
+        updatedBid.recommendation_confidence = recommendation.confidence;
+        updatedBid.recommendation_explanation = recommendation.explanation;
+      } catch (recError) {
+        console.error('Error generating recommendation for updated bid:', recError);
+        // Continue without recommendation data
+      }
+    }
+    
     res.status(200).json({
       success: true,
       message: 'Bid updated successfully',
-      data: result.rows[0]
+      data: updatedBid
     });
   } catch (error) {
     console.error('Error updating bid:', error);
@@ -438,6 +502,29 @@ const submitBid = async (req, res) => {
       });
     }
     
+    // Get provider details for AI recommendation
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    if (providerResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider details not found'
+      });
+    }
+    
+    const provider = providerResult.rows[0];
+    
+    // Get other bids for this service request for comparison
+    const otherBidsResult = await client.query(
+      'SELECT * FROM bids WHERE service_request_id = $1',
+      [id]
+    );
+    
+    const otherBids = otherBidsResult.rows;
+    
     // Start a transaction
     await client.query('BEGIN');
     
@@ -449,9 +536,11 @@ const submitBid = async (req, res) => {
     
     let result;
     let isNewBid = false;
+    let bidId;
     
     if (existingBidCheck.rows.length > 0) {
       // Update existing bid
+      bidId = existingBidCheck.rows[0].id;
       result = await client.query(`
         UPDATE bids
         SET 
@@ -471,7 +560,46 @@ const submitBid = async (req, res) => {
         RETURNING *
       `, [id, providerId, price, estimated_hours, description, 'pending']);
       
+      bidId = result.rows[0].id;
       isNewBid = true;
+    }
+    
+    // Create the bid object for AI recommendation
+    const bid = result.rows[0];
+    
+    // Generate AI recommendation
+    try {
+      const recommendation = await aiRecommendationService.generateRecommendation(
+        bid,
+        serviceRequest,
+        provider,
+        otherBids
+      );
+      
+      // Update bid with recommendation data
+      await client.query(`
+        UPDATE bids
+        SET 
+          ai_recommended = $1,
+          recommendation_score = $2,
+          recommendation_confidence = $3
+        WHERE id = $4
+        RETURNING *
+      `, [
+        recommendation.score > 0.7, // Flag as recommended if score is high
+        recommendation.score,
+        recommendation.confidence,
+        bidId
+      ]);
+      
+      // Add recommendation data to the result
+      bid.ai_recommended = recommendation.score > 0.7;
+      bid.recommendation_score = recommendation.score;
+      bid.recommendation_confidence = recommendation.confidence;
+      bid.recommendation_explanation = recommendation.explanation;
+    } catch (recError) {
+      console.error('Error generating recommendation:', recError);
+      // Continue without recommendation data
     }
     
     // If service request is still in 'pending' status, update it to 'bidding'
@@ -499,7 +627,7 @@ const submitBid = async (req, res) => {
     res.status(isNewBid ? 201 : 200).json({
       success: true,
       message: isNewBid ? 'Bid submitted successfully' : 'Bid updated successfully',
-      data: result.rows[0]
+      data: bid
     });
   } catch (error) {
     // Rollback transaction on error
@@ -646,5 +774,6 @@ module.exports = {
   getBidById,
   updateBid,
   deleteBid,
+  submitBid,
   acceptBid
-}; 
+};
