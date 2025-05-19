@@ -16,21 +16,19 @@ router.get('/:id', authMiddleware, paymentController.getPaymentById);
 // Refund routes
 router.post('/:id/refund', authMiddleware, paymentController.createRefund);
 
-// Webhook route (no auth needed as it's called by Stripe)
-router.post('/webhook', paymentController.handleWebhook);
-
-// Stripe Connect routes
-router.post('/connect/create-account', authMiddleware, authorizeRoles(['provider']), payoutController.createConnectAccount);
-router.post('/connect/create-account-link', authMiddleware, authorizeRoles(['provider']), payoutController.createAccountLink);
+// Stripe Connect routes for provider payments
+router.post('/connect/account', authMiddleware, authorizeRoles(['provider']), payoutController.createConnectAccount);
 router.get('/connect/account', authMiddleware, authorizeRoles(['provider']), payoutController.getConnectAccount);
-router.post('/connect/create-login-link', authMiddleware, authorizeRoles(['provider']), payoutController.createLoginLink);
+router.get('/connect/account-link', authMiddleware, authorizeRoles(['provider']), payoutController.createAccountLink);
+router.get('/connect/login-link', authMiddleware, authorizeRoles(['provider']), payoutController.createLoginLink);
 
-// Payout routes
-router.post('/connect/payout', authMiddleware, authorizeRoles(['admin', 'provider']), payoutController.processPayout);
-router.get('/connect/payouts', authMiddleware, authorizeRoles(['admin', 'provider']), payoutController.getPayoutHistory);
-router.get('/connect/payouts/:id', authMiddleware, payoutController.getPayoutById);
+// Provider payout routes
+router.post('/process-payout', authMiddleware, authorizeRoles(['admin']), payoutController.processPayout);
+router.get('/payouts', authMiddleware, authorizeRoles(['provider', 'admin']), payoutController.getPayoutHistory);
+router.get('/payouts/:id', authMiddleware, payoutController.getPayoutById);
 
-// Connect webhook route (no auth needed as it's called by Stripe)
+// Webhook routes (no auth needed as they're called by Stripe)
+router.post('/webhook', paymentController.handleWebhook);
 router.post('/connect/webhook', payoutController.handleConnectWebhook);
 
 module.exports = router;
