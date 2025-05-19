@@ -168,7 +168,7 @@ const confirmPayment = async (req, res) => {
     });
   }
 
-  const { payment_intent_id } = req.body;
+  const { payment_intent_id, auto_payout = false } = req.body;
   const client = req.db;
   
   try {
@@ -182,7 +182,12 @@ const confirmPayment = async (req, res) => {
     
     // Retrieve the payment from the database
     const paymentCheck = await client.query(`
-      SELECT p.*, h.user_id as homeowner_user_id, sp.user_id as provider_user_id
+      SELECT 
+        p.*, 
+        h.user_id as homeowner_user_id, 
+        sp.user_id as provider_user_id,
+        sp.stripe_connect_account_id,
+        sp.commission_rate
       FROM payments p
       JOIN homeowners h ON p.homeowner_id = h.id
       JOIN service_providers sp ON p.provider_id = sp.id
@@ -258,6 +263,81 @@ const confirmPayment = async (req, res) => {
       'received'
     );
     
+    // Process automatic payout to provider if requested and provider has Stripe Connect set up
+    let payoutResult = null;
+    if (auto_payout && payment.stripe_connect_account_id) {
+      try {
+        // Calculate platform fee
+        const commissionRate = payment.commission_rate || 10; // Default to 10% if not set
+        const platformFee = (payment.amount * commissionRate) / 100;
+        const payoutAmount = payment.amount - platformFee;
+        
+        // Create a transfer to the provider's Connect account
+        const transfer = await stripe.transfers.create({
+          amount: Math.round(payoutAmount * 100), // Convert to cents for Stripe
+          currency: payment.currency || 'usd',
+          destination: payment.stripe_connect_account_id,
+          source_transaction: payment.stripe_payment_intent_id,
+          description: `Payout for payment #${payment.id}`,
+          metadata: {
+            payment_id: payment.id,
+            provider_id: payment.provider_id,
+            platform_fee: platformFee,
+            original_amount: payment.amount
+          }
+        });
+        
+        // Record the payout in the database
+        const payoutQueryResult = await client.query(`
+          INSERT INTO provider_payouts (
+            provider_id,
+            payment_id,
+            stripe_transfer_id,
+            amount,
+            platform_fee,
+            original_amount,
+            currency,
+            status,
+            payout_date,
+            description
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, $9)
+          RETURNING *
+        `, [
+          payment.provider_id,
+          payment.id,
+          transfer.id,
+          payoutAmount,
+          platformFee,
+          payment.amount,
+          payment.currency || 'usd',
+          'completed',
+          `Automatic payout for payment #${payment.id}`
+        ]);
+        
+        payoutResult = {
+          payout_id: payoutQueryResult.rows[0].id,
+          transfer_id: transfer.id,
+          amount: payoutAmount,
+          platform_fee: platformFee,
+          original_amount: payment.amount,
+          currency: payment.currency || 'usd',
+          status: 'completed'
+        };
+        
+        // Create notification for provider about the payout
+        await createPaymentNotification(
+          client, 
+          payment.id, 
+          payment.provider_user_id, 
+          'payout_processed'
+        );
+      } catch (payoutError) {
+        console.error('Error processing automatic payout:', payoutError);
+        // Continue with payment confirmation even if payout fails
+      }
+    }
+    
     // Commit the transaction
     await client.query('COMMIT');
     
@@ -268,7 +348,8 @@ const confirmPayment = async (req, res) => {
         payment_id: payment.id,
         service_request_id: payment.service_request_id,
         amount: payment.amount,
-        status: 'completed'
+        status: 'completed',
+        payout: payoutResult
       }
     });
   } catch (error) {
@@ -328,7 +409,9 @@ const handleWebhook = async (req, res) => {
           SELECT 
             p.id, p.service_request_id, p.provider_id, 
             h.user_id as homeowner_user_id, 
-            sp.user_id as provider_user_id
+            sp.user_id as provider_user_id,
+            sp.stripe_connect_account_id,
+            sp.commission_rate
           FROM payments p
           JOIN homeowners h ON p.homeowner_id = h.id
           JOIN service_providers sp ON p.provider_id = sp.id
@@ -336,7 +419,8 @@ const handleWebhook = async (req, res) => {
         `, [paymentIntent.id]);
         
         if (paymentCheck.rows.length > 0) {
-          const { id, service_request_id, homeowner_user_id, provider_user_id } = paymentCheck.rows[0];
+          const payment = paymentCheck.rows[0];
+          const { id, service_request_id, homeowner_user_id, provider_user_id } = payment;
           
           // Update the service request status to in_progress if it's still in scheduled status
           const serviceRequestCheck = await client.query(`
@@ -354,6 +438,69 @@ const handleWebhook = async (req, res) => {
           // Create notifications
           await createPaymentNotification(client, id, homeowner_user_id, 'completed');
           await createPaymentNotification(client, id, provider_user_id, 'received');
+          
+          // Process automatic payout if provider has Stripe Connect set up
+          if (payment.stripe_connect_account_id) {
+            try {
+              // Calculate platform fee
+              const commissionRate = payment.commission_rate || 10; // Default to 10% if not set
+              const platformFee = (payment.amount * commissionRate) / 100;
+              const payoutAmount = payment.amount - platformFee;
+              
+              // Create a transfer to the provider's Connect account
+              const transfer = await stripe.transfers.create({
+                amount: Math.round(payoutAmount * 100), // Convert to cents for Stripe
+                currency: payment.currency || 'usd',
+                destination: payment.stripe_connect_account_id,
+                source_transaction: paymentIntent.id,
+                description: `Automatic payout for payment #${id}`,
+                metadata: {
+                  payment_id: id,
+                  provider_id: payment.provider_id,
+                  platform_fee: platformFee,
+                  original_amount: payment.amount
+                }
+              });
+              
+              // Record the payout in the database
+              await client.query(`
+                INSERT INTO provider_payouts (
+                  provider_id,
+                  payment_id,
+                  stripe_transfer_id,
+                  amount,
+                  platform_fee,
+                  original_amount,
+                  currency,
+                  status,
+                  payout_date,
+                  description
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, $9)
+              `, [
+                payment.provider_id,
+                id,
+                transfer.id,
+                payoutAmount,
+                platformFee,
+                payment.amount,
+                payment.currency || 'usd',
+                'completed',
+                `Automatic webhook payout for payment #${id}`
+              ]);
+              
+              // Create notification for provider about the payout
+              await createPaymentNotification(
+                client, 
+                id, 
+                provider_user_id, 
+                'payout_processed'
+              );
+            } catch (payoutError) {
+              console.error('Error processing automatic payout from webhook:', payoutError);
+              // Continue with payment processing even if payout fails
+            }
+          }
         }
         break;
       }
@@ -468,13 +615,16 @@ const getPaymentHistory = async (req, res) => {
           sr.description as service_description,
           s.name as service_name,
           prop.address as property_address,
-          u.first_name as homeowner_first_name, u.last_name as homeowner_last_name
+          u.first_name as homeowner_first_name, u.last_name as homeowner_last_name,
+          pp.id as payout_id, pp.amount as payout_amount, pp.status as payout_status, 
+          pp.platform_fee, pp.payout_date
         FROM payments p
         JOIN service_requests sr ON p.service_request_id = sr.id
         JOIN services s ON sr.service_id = s.id
         JOIN properties prop ON sr.property_id = prop.id
         JOIN homeowners h ON p.homeowner_id = h.id
         JOIN users u ON h.user_id = u.id
+        LEFT JOIN provider_payouts pp ON p.id = pp.payment_id AND pp.provider_id = p.provider_id
         WHERE p.provider_id = $1
         ORDER BY p.created_at DESC
       `;
@@ -489,7 +639,9 @@ const getPaymentHistory = async (req, res) => {
           s.name as service_name,
           prop.address as property_address,
           sp.company_name as provider_name,
-          u.first_name as homeowner_first_name, u.last_name as homeowner_last_name
+          u.first_name as homeowner_first_name, u.last_name as homeowner_last_name,
+          pp.id as payout_id, pp.amount as payout_amount, pp.status as payout_status, 
+          pp.platform_fee, pp.payout_date
         FROM payments p
         JOIN service_requests sr ON p.service_request_id = sr.id
         JOIN services s ON sr.service_id = s.id
@@ -497,6 +649,7 @@ const getPaymentHistory = async (req, res) => {
         JOIN service_providers sp ON p.provider_id = sp.id
         JOIN homeowners h ON p.homeowner_id = h.id
         JOIN users u ON h.user_id = u.id
+        LEFT JOIN provider_payouts pp ON p.id = pp.payment_id AND pp.provider_id = p.provider_id
         ORDER BY p.created_at DESC
         LIMIT 100
       `;
@@ -540,9 +693,11 @@ const getPaymentById = async (req, res) => {
         sr.description as service_description, sr.status as service_status,
         s.name as service_name,
         prop.address as property_address,
-        sp.company_name as provider_name,
+        sp.company_name as provider_name, sp.stripe_connect_account_id,
         h.user_id as homeowner_user_id,
-        prov.user_id as provider_user_id
+        prov.user_id as provider_user_id,
+        pp.id as payout_id, pp.amount as payout_amount, pp.status as payout_status, 
+        pp.platform_fee, pp.payout_date
       FROM payments p
       JOIN service_requests sr ON p.service_request_id = sr.id
       JOIN services s ON sr.service_id = s.id
@@ -550,6 +705,7 @@ const getPaymentById = async (req, res) => {
       JOIN service_providers sp ON p.provider_id = sp.id
       JOIN homeowners h ON p.homeowner_id = h.id
       JOIN service_providers prov ON p.provider_id = prov.id
+      LEFT JOIN provider_payouts pp ON p.id = pp.payment_id AND pp.provider_id = p.provider_id
       WHERE p.id = $1
     `, [id]);
     
@@ -593,9 +749,28 @@ const getPaymentById = async (req, res) => {
       }
     }
     
+    // Format the response to include payout information
+    const response = {
+      ...payment,
+      payout: payment.payout_id ? {
+        id: payment.payout_id,
+        amount: payment.payout_amount,
+        status: payment.payout_status,
+        platform_fee: payment.platform_fee,
+        payout_date: payment.payout_date
+      } : null
+    };
+    
+    // Remove the duplicate fields
+    delete response.payout_id;
+    delete response.payout_amount;
+    delete response.payout_status;
+    delete response.platform_fee;
+    delete response.payout_date;
+    
     res.status(200).json({
       success: true,
-      data: payment
+      data: response
     });
   } catch (error) {
     console.error('Error getting payment details:', error);
@@ -625,19 +800,25 @@ const createRefund = async (req, res) => {
   const client = req.db;
   
   try {
+    // Start a transaction
+    await client.query('BEGIN');
+    
     // Retrieve the payment from the database
     const paymentCheck = await client.query(`
       SELECT 
         p.*,
         h.user_id as homeowner_user_id,
-        prov.user_id as provider_user_id
+        prov.user_id as provider_user_id,
+        pp.id as payout_id, pp.stripe_transfer_id
       FROM payments p
       JOIN homeowners h ON p.homeowner_id = h.id
       JOIN service_providers prov ON p.provider_id = prov.id
+      LEFT JOIN provider_payouts pp ON p.id = pp.payment_id AND pp.provider_id = p.provider_id
       WHERE p.id = $1
     `, [id]);
     
     if (paymentCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({
         success: false,
         message: 'Payment not found'
@@ -648,6 +829,7 @@ const createRefund = async (req, res) => {
     
     // Only allow refunds for completed payments
     if (payment.status !== 'completed') {
+      await client.query('ROLLBACK');
       return res.status(400).json({
         success: false,
         message: `Cannot refund a payment with status '${payment.status}'`
@@ -656,6 +838,7 @@ const createRefund = async (req, res) => {
     
     // Only allow homeowner, provider involved in the payment, or admin to create a refund
     if (req.user.role === 'homeowner' && req.user.id !== parseInt(payment.homeowner_user_id)) {
+      await client.query('ROLLBACK');
       return res.status(403).json({
         success: false,
         message: 'Not authorized to refund this payment'
@@ -663,6 +846,7 @@ const createRefund = async (req, res) => {
     }
     
     if (req.user.role === 'provider' && req.user.id !== parseInt(payment.provider_user_id)) {
+      await client.query('ROLLBACK');
       return res.status(403).json({
         success: false,
         message: 'Not authorized to refund this payment'
@@ -675,6 +859,7 @@ const createRefund = async (req, res) => {
     );
     
     if (!paymentIntent.latest_charge) {
+      await client.query('ROLLBACK');
       return res.status(400).json({
         success: false,
         message: 'No charge found for this payment'
@@ -688,6 +873,44 @@ const createRefund = async (req, res) => {
       amount: refundAmount, // If undefined, refund the full amount
       reason: reason || 'requested_by_customer'
     });
+    
+    // If there was a payout, create a transfer reversal
+    if (payment.payout_id && payment.stripe_transfer_id) {
+      try {
+        // Calculate the amount to reverse from the transfer
+        const reverseAmount = refundAmount ? 
+          Math.min(refundAmount, Math.round(payment.payout_amount * 100)) : 
+          Math.round(payment.payout_amount * 100);
+        
+        // Create a transfer reversal
+        await stripe.transfers.createReversal(
+          payment.stripe_transfer_id,
+          {
+            amount: reverseAmount,
+            description: `Reversal for refund of payment #${payment.id}`,
+            metadata: {
+              payment_id: payment.id,
+              refund_id: refund.id
+            }
+          }
+        );
+        
+        // Update the payout status
+        await client.query(`
+          UPDATE provider_payouts
+          SET 
+            status = CASE 
+              WHEN $1 IS NULL OR $1 >= amount * 100 THEN 'reversed' 
+              ELSE 'partially_reversed' 
+            END,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = $2
+        `, [refundAmount, payment.payout_id]);
+      } catch (reversalError) {
+        console.error('Error creating transfer reversal:', reversalError);
+        // Continue with the refund even if the reversal fails
+      }
+    }
     
     // Save the refund to the database
     const refundResult = await client.query(`
@@ -728,6 +951,24 @@ const createRefund = async (req, res) => {
       id
     ]);
     
+    // Create notifications for both homeowner and provider
+    await createPaymentNotification(
+      client, 
+      payment.id, 
+      payment.homeowner_user_id, 
+      'refunded'
+    );
+    
+    await createPaymentNotification(
+      client, 
+      payment.id, 
+      payment.provider_user_id, 
+      'refunded'
+    );
+    
+    // Commit the transaction
+    await client.query('COMMIT');
+    
     res.status(200).json({
       success: true,
       message: 'Refund processed successfully',
@@ -739,6 +980,9 @@ const createRefund = async (req, res) => {
       }
     });
   } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
     console.error('Error processing refund:', error);
     res.status(500).json({
       success: false,
@@ -820,10 +1064,13 @@ const getPaymentAnalytics = async (req, res) => {
         SELECT 
           DATE_TRUNC('day', payment_date) as day,
           SUM(amount) as total_amount,
-          COUNT(*) as transaction_count
-        FROM payments
-        WHERE provider_id = $${paramIndex} AND status = 'completed'
-          AND payment_date >= $${paramIndex + 1} AND payment_date <= $${paramIndex + 2}
+          COUNT(*) as transaction_count,
+          COALESCE(SUM(pp.platform_fee), 0) as total_fees,
+          COALESCE(SUM(pp.amount), 0) as total_earnings
+        FROM payments p
+        LEFT JOIN provider_payouts pp ON p.id = pp.payment_id AND pp.provider_id = p.provider_id
+        WHERE p.provider_id = $${paramIndex} AND p.status = 'completed'
+          AND p.payment_date >= $${paramIndex + 1} AND p.payment_date <= $${paramIndex + 2}
         GROUP BY DATE_TRUNC('day', payment_date)
         ORDER BY day ASC
       `;
@@ -834,10 +1081,13 @@ const getPaymentAnalytics = async (req, res) => {
         SELECT 
           DATE_TRUNC('day', payment_date) as day,
           SUM(amount) as total_amount,
-          COUNT(*) as transaction_count
-        FROM payments
-        WHERE status = 'completed'
-          AND payment_date >= $1 AND payment_date <= $2
+          COUNT(*) as transaction_count,
+          COALESCE(SUM(pp.platform_fee), 0) as total_fees,
+          COALESCE(SUM(pp.amount), 0) as total_payouts
+        FROM payments p
+        LEFT JOIN provider_payouts pp ON p.id = pp.payment_id AND pp.provider_id = p.provider_id
+        WHERE p.status = 'completed'
+          AND p.payment_date >= $1 AND p.payment_date <= $2
         GROUP BY DATE_TRUNC('day', payment_date)
         ORDER BY day ASC
       `;
@@ -849,10 +1099,14 @@ const getPaymentAnalytics = async (req, res) => {
     // Calculate summary statistics
     let totalAmount = 0;
     let totalTransactions = 0;
+    let totalFees = 0;
+    let totalEarnings = 0;
     
     result.rows.forEach(row => {
       totalAmount += parseFloat(row.total_amount);
       totalTransactions += parseInt(row.transaction_count);
+      totalFees += parseFloat(row.total_fees || 0);
+      totalEarnings += parseFloat(req.user.role === 'provider' ? row.total_earnings : row.total_payouts || 0);
     });
     
     const averageTransactionValue = totalTransactions > 0 
@@ -867,6 +1121,8 @@ const getPaymentAnalytics = async (req, res) => {
           total_amount: totalAmount.toFixed(2),
           total_transactions: totalTransactions,
           average_transaction_value: averageTransactionValue.toFixed(2),
+          total_fees: totalFees.toFixed(2),
+          total_earnings: totalEarnings.toFixed(2),
           period: period,
           start_date: startDateStr,
           end_date: endDateStr
@@ -891,4 +1147,4 @@ module.exports = {
   getPaymentById,
   createRefund,
   getPaymentAnalytics
-}; 
+};
