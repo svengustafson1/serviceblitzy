@@ -1,7 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { authMiddleware, authorizeRoles } = require('../middleware/auth.middleware');
-const { upload, handleMulterError } = require('../middleware/upload.middleware');
+const multer = require('multer');
+
+// Configure multer for memory storage (files will be processed and sent to S3)
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Import controllers
 const {
@@ -11,18 +14,14 @@ const {
   updateProperty,
   deleteProperty,
   generateQrCode,
-  getPropertyByHash
-} = require('../controllers/property.controller');
-
-// Import file upload controllers
-const {
+  getPropertyByHash,
   uploadPropertyFiles,
   getPropertyFiles,
-  deletePropertyFile,
-  getPropertyFileById
-} = require('../controllers/file-upload.controller');
+  getPropertyFile,
+  deletePropertyFile
+} = require('../controllers/property.controller');
 
-// Property Routes
+// Routes
 router.get('/', authMiddleware, authorizeRoles(['admin']), getAllProperties);
 router.post('/', authMiddleware, authorizeRoles(['homeowner']), createProperty);
 router.get('/access/:hash', getPropertyByHash); // Public route - no auth required
@@ -31,15 +30,11 @@ router.put('/:id', authMiddleware, updateProperty);
 router.delete('/:id', authMiddleware, deleteProperty);
 router.post('/:id/qr-code', authMiddleware, generateQrCode);
 
-// File Upload Routes
-router.post('/:id/files', 
-  authMiddleware, 
-  upload.single('file'), 
-  handleMulterError, 
-  uploadPropertyFiles
-);
+// File upload routes
+router.post('/:id/files', authMiddleware, upload.single('file'), uploadPropertyFiles);
+router.post('/:id/files/multiple', authMiddleware, upload.array('files', 10), uploadPropertyFiles);
 router.get('/:id/files', authMiddleware, getPropertyFiles);
-router.get('/:propertyId/files/:fileId', authMiddleware, getPropertyFileById);
-router.delete('/:propertyId/files/:fileId', authMiddleware, deletePropertyFile);
+router.get('/:id/files/:fileId', authMiddleware, getPropertyFile);
+router.delete('/:id/files/:fileId', authMiddleware, deletePropertyFile);
 
 module.exports = router;
