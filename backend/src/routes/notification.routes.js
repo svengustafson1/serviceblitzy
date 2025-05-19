@@ -18,4 +18,22 @@ router.patch('/mark-read', authMiddleware, notificationController.markNotificati
 // Delete notifications
 router.delete('/', authMiddleware, notificationController.deleteNotifications);
 
-module.exports = router; 
+// Get notifications with delivery status filtering
+router.get('/status/:status', authMiddleware, notificationController.getNotificationsByDeliveryStatus);
+
+// Update notification delivery status
+router.patch('/delivery-status', authMiddleware, notificationController.updateDeliveryStatus);
+
+// Retry failed notification delivery
+router.post('/retry-delivery', authMiddleware, notificationController.retryFailedDelivery);
+
+// Poll for new notifications (fallback when WebSocket is unavailable)
+router.get('/poll', authMiddleware, notificationController.pollNewNotifications);
+
+// Subscribe to WebSocket notifications
+router.post('/subscribe', authMiddleware, notificationController.subscribeToNotifications);
+
+// Unsubscribe from WebSocket notifications
+router.post('/unsubscribe', authMiddleware, notificationController.unsubscribeFromNotifications);
+
+module.exports = router;
