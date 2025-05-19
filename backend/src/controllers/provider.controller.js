@@ -2,6 +2,7 @@
  * Provider Controller
  * Handles all operations related to service providers
  */
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 /**
  * Get all providers (with filtering options)
@@ -179,6 +180,26 @@ const getProviderById = async (req, res) => {
     `, [id]);
     
     provider.completed_jobs = parseInt(jobsResult.rows[0].completed_jobs);
+    
+    // Get Stripe Connect account status if available
+    if (provider.stripe_connect_account_id) {
+      try {
+        const connectAccount = await stripe.accounts.retrieve(provider.stripe_connect_account_id);
+        
+        provider.connect_account_status = {
+          charges_enabled: connectAccount.charges_enabled,
+          payouts_enabled: connectAccount.payouts_enabled,
+          details_submitted: connectAccount.details_submitted,
+          capabilities: connectAccount.capabilities,
+          requirements: connectAccount.requirements
+        };
+      } catch (stripeError) {
+        console.error('Error fetching Stripe Connect account:', stripeError);
+        provider.connect_account_status = { error: 'Unable to fetch Connect account status' };
+      }
+    } else {
+      provider.connect_account_status = { status: 'not_connected' };
+    }
     
     res.status(200).json({
       success: true,
@@ -627,6 +648,583 @@ const getProviderJobs = async (req, res) => {
 };
 
 /**
+ * Create a Stripe Connect account for a provider
+ * @route POST /api/providers/connect/account
+ */
+const createConnectAccount = async (req, res) => {
+  const client = req.db;
+  
+  try {
+    // Get provider ID
+    const providerId = await getProviderIdFromUserId(client, req.user.id);
+    
+    if (!providerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider profile not found'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    const provider = providerResult.rows[0];
+    
+    // Check if provider already has a Connect account
+    if (provider.stripe_connect_account_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Provider already has a Stripe Connect account'
+      });
+    }
+    
+    // Get user details for the provider
+    const userResult = await client.query(
+      'SELECT * FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    
+    const user = userResult.rows[0];
+    
+    // Create a Stripe Connect account
+    const account = await stripe.accounts.create({
+      type: 'express',
+      country: 'US',
+      email: user.email,
+      business_type: 'individual',
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true }
+      },
+      business_profile: {
+        mcc: '1520', // General Contractors
+        url: provider.website || `https://homehub.com/providers/${providerId}`
+      },
+      metadata: {
+        provider_id: providerId
+      }
+    });
+    
+    // Update provider record with Connect account ID
+    await client.query(
+      'UPDATE service_providers SET stripe_connect_account_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+      [account.id, providerId]
+    );
+    
+    res.status(201).json({
+      success: true,
+      message: 'Stripe Connect account created successfully',
+      data: {
+        account_id: account.id
+      }
+    });
+  } catch (error) {
+    console.error('Error creating Stripe Connect account:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating Stripe Connect account',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get the status of a provider's Connect account
+ * @route GET /api/providers/connect/account/status
+ */
+const getConnectAccountStatus = async (req, res) => {
+  const client = req.db;
+  
+  try {
+    // Get provider ID
+    const providerId = await getProviderIdFromUserId(client, req.user.id);
+    
+    if (!providerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider profile not found'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    const provider = providerResult.rows[0];
+    
+    // Check if provider has a Connect account
+    if (!provider.stripe_connect_account_id) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider does not have a Stripe Connect account',
+        data: {
+          status: 'not_connected'
+        }
+      });
+    }
+    
+    // Retrieve the Connect account from Stripe
+    const account = await stripe.accounts.retrieve(provider.stripe_connect_account_id);
+    
+    // Determine account status
+    let status = 'pending';
+    if (account.charges_enabled && account.payouts_enabled) {
+      status = 'active';
+    } else if (account.requirements && account.requirements.currently_due && account.requirements.currently_due.length > 0) {
+      status = 'incomplete';
+    } else if (account.requirements && account.requirements.disabled_reason) {
+      status = 'restricted';
+    }
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        account_id: account.id,
+        status,
+        details_submitted: account.details_submitted,
+        charges_enabled: account.charges_enabled,
+        payouts_enabled: account.payouts_enabled,
+        requirements: account.requirements,
+        capabilities: account.capabilities
+      }
+    });
+  } catch (error) {
+    console.error('Error getting Connect account status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching Connect account status',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Generate an onboarding link for a provider
+ * @route POST /api/providers/connect/account/onboard
+ */
+const createAccountLink = async (req, res) => {
+  const client = req.db;
+  
+  try {
+    // Get provider ID
+    const providerId = await getProviderIdFromUserId(client, req.user.id);
+    
+    if (!providerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider profile not found'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    const provider = providerResult.rows[0];
+    
+    // Check if provider has a Connect account
+    if (!provider.stripe_connect_account_id) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider does not have a Stripe Connect account'
+      });
+    }
+    
+    // Create an account link for onboarding
+    const accountLink = await stripe.accountLinks.create({
+      account: provider.stripe_connect_account_id,
+      refresh_url: `${process.env.FRONTEND_URL}/dashboard/provider/connect/refresh`,
+      return_url: `${process.env.FRONTEND_URL}/dashboard/provider/connect/complete`,
+      type: 'account_onboarding',
+      collect: 'eventually_due'
+    });
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        url: accountLink.url
+      }
+    });
+  } catch (error) {
+    console.error('Error creating account link:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating account link',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get a provider's banking information
+ * @route GET /api/providers/connect/banking
+ */
+const getBankingInformation = async (req, res) => {
+  const client = req.db;
+  
+  try {
+    // Get provider ID
+    const providerId = await getProviderIdFromUserId(client, req.user.id);
+    
+    if (!providerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider profile not found'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    const provider = providerResult.rows[0];
+    
+    // Check if provider has a Connect account
+    if (!provider.stripe_connect_account_id) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider does not have a Stripe Connect account'
+      });
+    }
+    
+    // Retrieve the Connect account from Stripe
+    const account = await stripe.accounts.retrieve(provider.stripe_connect_account_id);
+    
+    // Get external accounts (bank accounts)
+    const externalAccounts = await stripe.accounts.listExternalAccounts(
+      provider.stripe_connect_account_id,
+      { object: 'bank_account', limit: 10 }
+    );
+    
+    // Format the response
+    const bankingInfo = {
+      external_accounts: externalAccounts.data.map(account => ({
+        id: account.id,
+        bank_name: account.bank_name,
+        last4: account.last4,
+        routing_number: account.routing_number,
+        account_holder_name: account.account_holder_name,
+        account_holder_type: account.account_holder_type,
+        currency: account.currency,
+        country: account.country,
+        default_for_currency: account.default_for_currency
+      })),
+      has_external_account: externalAccounts.data.length > 0
+    };
+    
+    res.status(200).json({
+      success: true,
+      data: bankingInfo
+    });
+  } catch (error) {
+    console.error('Error getting banking information:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching banking information',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Update a provider's banking information
+ * @route PUT /api/providers/connect/banking
+ */
+const updateBankingInformation = async (req, res) => {
+  const { external_account, default_for_currency } = req.body;
+  const client = req.db;
+  
+  try {
+    // Get provider ID
+    const providerId = await getProviderIdFromUserId(client, req.user.id);
+    
+    if (!providerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider profile not found'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    const provider = providerResult.rows[0];
+    
+    // Check if provider has a Connect account
+    if (!provider.stripe_connect_account_id) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider does not have a Stripe Connect account'
+      });
+    }
+    
+    // If external_account is provided, create or update bank account
+    if (external_account) {
+      // Create a new external account
+      const bankAccount = await stripe.accounts.createExternalAccount(
+        provider.stripe_connect_account_id,
+        { external_account }
+      );
+      
+      // If default_for_currency is true, set as default
+      if (default_for_currency) {
+        await stripe.accounts.updateExternalAccount(
+          provider.stripe_connect_account_id,
+          bankAccount.id,
+          { default_for_currency: true }
+        );
+      }
+      
+      res.status(200).json({
+        success: true,
+        message: 'Banking information updated successfully',
+        data: {
+          id: bankAccount.id,
+          bank_name: bankAccount.bank_name,
+          last4: bankAccount.last4,
+          routing_number: bankAccount.routing_number,
+          account_holder_name: bankAccount.account_holder_name,
+          account_holder_type: bankAccount.account_holder_type,
+          currency: bankAccount.currency,
+          country: bankAccount.country,
+          default_for_currency: bankAccount.default_for_currency || default_for_currency
+        }
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: 'External account information is required'
+      });
+    }
+  } catch (error) {
+    console.error('Error updating banking information:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating banking information',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get a provider's payout preferences
+ * @route GET /api/providers/connect/payout-preferences
+ */
+const getPayoutPreferences = async (req, res) => {
+  const client = req.db;
+  
+  try {
+    // Get provider ID
+    const providerId = await getProviderIdFromUserId(client, req.user.id);
+    
+    if (!providerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider profile not found'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    const provider = providerResult.rows[0];
+    
+    // Check if provider has a Connect account
+    if (!provider.stripe_connect_account_id) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider does not have a Stripe Connect account'
+      });
+    }
+    
+    // Retrieve the Connect account from Stripe
+    const account = await stripe.accounts.retrieve(provider.stripe_connect_account_id);
+    
+    // Format the response
+    const payoutPreferences = {
+      payout_schedule: account.settings?.payouts?.schedule || {
+        interval: 'standard',
+        weekly_anchor: null,
+        monthly_anchor: null
+      },
+      statement_descriptor: account.settings?.payments?.statement_descriptor || null,
+      default_currency: account.default_currency || 'usd'
+    };
+    
+    res.status(200).json({
+      success: true,
+      data: payoutPreferences
+    });
+  } catch (error) {
+    console.error('Error getting payout preferences:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching payout preferences',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Update a provider's payout preferences
+ * @route PUT /api/providers/connect/payout-preferences
+ */
+const updatePayoutPreferences = async (req, res) => {
+  const { payout_schedule, statement_descriptor } = req.body;
+  const client = req.db;
+  
+  try {
+    // Get provider ID
+    const providerId = await getProviderIdFromUserId(client, req.user.id);
+    
+    if (!providerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider profile not found'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    const provider = providerResult.rows[0];
+    
+    // Check if provider has a Connect account
+    if (!provider.stripe_connect_account_id) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider does not have a Stripe Connect account'
+      });
+    }
+    
+    // Prepare update parameters
+    const updateParams = {};
+    
+    if (payout_schedule) {
+      updateParams['settings[payouts][schedule][interval]'] = payout_schedule.interval;
+      
+      if (payout_schedule.interval === 'weekly' && payout_schedule.weekly_anchor) {
+        updateParams['settings[payouts][schedule][weekly_anchor]'] = payout_schedule.weekly_anchor;
+      } else if (payout_schedule.interval === 'monthly' && payout_schedule.monthly_anchor) {
+        updateParams['settings[payouts][schedule][monthly_anchor]'] = payout_schedule.monthly_anchor;
+      }
+    }
+    
+    if (statement_descriptor) {
+      updateParams['settings[payments][statement_descriptor]'] = statement_descriptor;
+    }
+    
+    // Update the Connect account
+    const updatedAccount = await stripe.accounts.update(
+      provider.stripe_connect_account_id,
+      updateParams
+    );
+    
+    // Format the response
+    const updatedPreferences = {
+      payout_schedule: updatedAccount.settings?.payouts?.schedule || {
+        interval: 'standard',
+        weekly_anchor: null,
+        monthly_anchor: null
+      },
+      statement_descriptor: updatedAccount.settings?.payments?.statement_descriptor || null,
+      default_currency: updatedAccount.default_currency || 'usd'
+    };
+    
+    res.status(200).json({
+      success: true,
+      message: 'Payout preferences updated successfully',
+      data: updatedPreferences
+    });
+  } catch (error) {
+    console.error('Error updating payout preferences:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating payout preferences',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get a provider's verification status
+ * @route GET /api/providers/connect/verification-status
+ */
+const getVerificationStatus = async (req, res) => {
+  const client = req.db;
+  
+  try {
+    // Get provider ID
+    const providerId = await getProviderIdFromUserId(client, req.user.id);
+    
+    if (!providerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider profile not found'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [providerId]
+    );
+    
+    const provider = providerResult.rows[0];
+    
+    // Check if provider has a Connect account
+    if (!provider.stripe_connect_account_id) {
+      return res.status(404).json({
+        success: false,
+        message: 'Provider does not have a Stripe Connect account'
+      });
+    }
+    
+    // Retrieve the Connect account from Stripe
+    const account = await stripe.accounts.retrieve(provider.stripe_connect_account_id);
+    
+    // Format the verification status
+    const verificationStatus = {
+      details_submitted: account.details_submitted,
+      charges_enabled: account.charges_enabled,
+      payouts_enabled: account.payouts_enabled,
+      requirements: account.requirements,
+      verification: account.individual?.verification || null
+    };
+    
+    res.status(200).json({
+      success: true,
+      data: verificationStatus
+    });
+  } catch (error) {
+    console.error('Error getting verification status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching verification status',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
  * Helper function to get provider ID from user ID
  */
 const getProviderIdFromUserId = async (client, userId) => {
@@ -644,5 +1242,13 @@ module.exports = {
   createProvider,
   updateProvider,
   getAvailableServiceRequests,
-  getProviderJobs
-}; 
+  getProviderJobs,
+  createConnectAccount,
+  getConnectAccountStatus,
+  createAccountLink,
+  getBankingInformation,
+  updateBankingInformation,
+  getPayoutPreferences,
+  updatePayoutPreferences,
+  getVerificationStatus
+};
