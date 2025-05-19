@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS recurring_schedules (
 );
 
 -- Create index for faster lookups by service request
-CREATE INDEX IF NOT EXISTS idx_recurring_schedules_service_request_id ON recurring_schedules(service_request_id);
+CREATE INDEX IF NOT EXISTS idx_recurring_schedules_service_request ON recurring_schedules(service_request_id);
 
 -- Create index for faster lookups by next run time
 CREATE INDEX IF NOT EXISTS idx_recurring_schedules_next_run ON recurring_schedules(next_run);
