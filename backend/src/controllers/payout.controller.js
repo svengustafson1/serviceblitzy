@@ -1,7 +1,10 @@
 /**
  * Payout Controller
- * Handles all payout-related operations for service providers using Stripe Connect
+ * Manages automated payment distribution to service providers using Stripe Connect
+ * Implements payout scheduling, history tracking, and notification generation
  */
+
+// Initialize Stripe with API key from environment variables
 let stripe;
 
 try {
@@ -9,42 +12,34 @@ try {
   if (process.env.STRIPE_SECRET_KEY) {
     stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
   } else {
-    console.warn('STRIPE_SECRET_KEY not found in environment variables. Payment features will be disabled.');
+    console.warn('STRIPE_SECRET_KEY not found in environment variables. Payout features will be disabled.');
   }
 } catch (error) {
   console.error('Error initializing Stripe:', error);
 }
 
 // Import notification helper functions
-const { createNotification } = require('./notification.controller');
+const { createPaymentNotification } = require('./notification.controller');
 
 // Helper function to check if Stripe is configured
 const isStripeConfigured = () => !!stripe;
 
 /**
- * Create a Connect account for a service provider
- * @route POST /api/payments/connect/create-account
+ * Create a Stripe Connect account for a service provider
+ * @route POST /api/payouts/connect/create-account
  */
 const createConnectAccount = async (req, res) => {
   // Check if Stripe is configured
   if (!isStripeConfigured()) {
     return res.status(503).json({
       success: false,
-      message: 'Payment service is currently unavailable. Please configure Stripe API keys.'
+      message: 'Payout service is currently unavailable. Please configure Stripe API keys.'
     });
   }
 
   const client = req.db;
   
   try {
-    // Verify the user is a service provider
-    if (req.user.role !== 'provider') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only service providers can create Connect accounts'
-      });
-    }
-    
     // Get provider details
     const providerResult = await client.query(
       'SELECT * FROM service_providers WHERE user_id = $1',
@@ -60,11 +55,11 @@ const createConnectAccount = async (req, res) => {
     
     const provider = providerResult.rows[0];
     
-    // Check if provider already has a Connect account
-    if (provider.stripe_connect_account_id) {
+    // Check if provider already has a Stripe Connect account
+    if (provider.stripe_account_id) {
       return res.status(400).json({
         success: false,
-        message: 'Provider already has a Connect account'
+        message: 'Provider already has a Stripe Connect account'
       });
     }
     
@@ -83,10 +78,10 @@ const createConnectAccount = async (req, res) => {
     
     const user = userResult.rows[0];
     
-    // Create a Connect Express account
+    // Create a Custom Connect account
     const account = await stripe.accounts.create({
-      type: 'express',
-      country: 'US', // Default to US, can be made dynamic based on user's country
+      type: 'custom',
+      country: 'US', // Default to US, can be made configurable
       email: user.email,
       capabilities: {
         card_payments: {requested: true},
@@ -94,8 +89,8 @@ const createConnectAccount = async (req, res) => {
       },
       business_type: 'individual',
       business_profile: {
-        name: provider.company_name || `${user.first_name} ${user.last_name}`,
-        url: provider.website || `https://homehub.com/providers/${provider.id}`,
+        name: provider.company_name,
+        url: process.env.WEBSITE_URL || 'https://homehub.com',
       },
       metadata: {
         provider_id: provider.id,
@@ -103,17 +98,20 @@ const createConnectAccount = async (req, res) => {
       }
     });
     
-    // Update the provider record with the Connect account ID
+    // Update provider record with Stripe account ID
     await client.query(
-      'UPDATE service_providers SET stripe_connect_account_id = $1 WHERE id = $2',
+      'UPDATE service_providers SET stripe_account_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
       [account.id, provider.id]
     );
     
     res.status(201).json({
       success: true,
-      message: 'Connect account created successfully',
+      message: 'Stripe Connect account created successfully',
       data: {
-        account_id: account.id
+        account_id: account.id,
+        details_submitted: account.details_submitted,
+        charges_enabled: account.charges_enabled,
+        payouts_enabled: account.payouts_enabled
       }
     });
   } catch (error) {
@@ -127,29 +125,21 @@ const createConnectAccount = async (req, res) => {
 };
 
 /**
- * Create an account link for onboarding
- * @route POST /api/payments/connect/create-account-link
+ * Create an account link for Stripe Connect onboarding
+ * @route POST /api/payouts/connect/create-account-link
  */
 const createAccountLink = async (req, res) => {
   // Check if Stripe is configured
   if (!isStripeConfigured()) {
     return res.status(503).json({
       success: false,
-      message: 'Payment service is currently unavailable. Please configure Stripe API keys.'
+      message: 'Payout service is currently unavailable. Please configure Stripe API keys.'
     });
   }
 
   const client = req.db;
   
   try {
-    // Verify the user is a service provider
-    if (req.user.role !== 'provider') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only service providers can access Connect onboarding'
-      });
-    }
-    
     // Get provider details
     const providerResult = await client.query(
       'SELECT * FROM service_providers WHERE user_id = $1',
@@ -165,20 +155,21 @@ const createAccountLink = async (req, res) => {
     
     const provider = providerResult.rows[0];
     
-    // Check if provider has a Connect account
-    if (!provider.stripe_connect_account_id) {
+    // Check if provider has a Stripe Connect account
+    if (!provider.stripe_account_id) {
       return res.status(400).json({
         success: false,
-        message: 'Provider does not have a Connect account yet'
+        message: 'Provider does not have a Stripe Connect account. Please create one first.'
       });
     }
     
     // Create an account link for onboarding
     const accountLink = await stripe.accountLinks.create({
-      account: provider.stripe_connect_account_id,
-      refresh_url: `${process.env.FRONTEND_URL}/provider/connect/refresh`,
-      return_url: `${process.env.FRONTEND_URL}/provider/connect/complete`,
+      account: provider.stripe_account_id,
+      refresh_url: `${process.env.FRONTEND_URL}/dashboard/provider/connect/refresh`,
+      return_url: `${process.env.FRONTEND_URL}/dashboard/provider/connect/complete`,
       type: 'account_onboarding',
+      collect: 'eventually_due'
     });
     
     res.status(200).json({
@@ -198,29 +189,21 @@ const createAccountLink = async (req, res) => {
 };
 
 /**
- * Get Connect account details
- * @route GET /api/payments/connect/account
+ * Get Stripe Connect account details
+ * @route GET /api/payouts/connect/account
  */
 const getConnectAccount = async (req, res) => {
   // Check if Stripe is configured
   if (!isStripeConfigured()) {
     return res.status(503).json({
       success: false,
-      message: 'Payment service is currently unavailable. Please configure Stripe API keys.'
+      message: 'Payout service is currently unavailable. Please configure Stripe API keys.'
     });
   }
 
   const client = req.db;
   
   try {
-    // Verify the user is a service provider
-    if (req.user.role !== 'provider') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only service providers can access Connect account details'
-      });
-    }
-    
     // Get provider details
     const providerResult = await client.query(
       'SELECT * FROM service_providers WHERE user_id = $1',
@@ -236,44 +219,27 @@ const getConnectAccount = async (req, res) => {
     
     const provider = providerResult.rows[0];
     
-    // Check if provider has a Connect account
-    if (!provider.stripe_connect_account_id) {
-      return res.status(400).json({
+    // Check if provider has a Stripe Connect account
+    if (!provider.stripe_account_id) {
+      return res.status(404).json({
         success: false,
-        message: 'Provider does not have a Connect account yet'
+        message: 'Provider does not have a Stripe Connect account'
       });
     }
     
-    // Retrieve the Connect account
-    const account = await stripe.accounts.retrieve(provider.stripe_connect_account_id);
-    
-    // Check if the account is fully onboarded
-    const isOnboarded = 
-      account.details_submitted && 
-      account.payouts_enabled && 
-      account.capabilities.card_payments === 'active' && 
-      account.capabilities.transfers === 'active';
-    
-    // Update the onboarding status if needed
-    if (isOnboarded && !provider.stripe_connect_onboarded) {
-      await client.query(
-        'UPDATE service_providers SET stripe_connect_onboarded = true, stripe_connect_onboarding_date = CURRENT_TIMESTAMP WHERE id = $1',
-        [provider.id]
-      );
-    }
+    // Retrieve the account from Stripe
+    const account = await stripe.accounts.retrieve(provider.stripe_account_id);
     
     res.status(200).json({
       success: true,
       data: {
         account_id: account.id,
+        details_submitted: account.details_submitted,
         charges_enabled: account.charges_enabled,
         payouts_enabled: account.payouts_enabled,
-        details_submitted: account.details_submitted,
-        is_onboarded: isOnboarded,
-        default_currency: account.default_currency,
-        business_profile: account.business_profile,
-        capabilities: account.capabilities,
-        requirements: account.requirements
+        requirements: account.requirements,
+        external_accounts: account.external_accounts,
+        settings: account.settings
       }
     });
   } catch (error) {
@@ -287,29 +253,21 @@ const getConnectAccount = async (req, res) => {
 };
 
 /**
- * Create a login link for the Connect dashboard
- * @route POST /api/payments/connect/create-login-link
+ * Create a login link for Stripe Connect dashboard
+ * @route POST /api/payouts/connect/create-login-link
  */
 const createLoginLink = async (req, res) => {
   // Check if Stripe is configured
   if (!isStripeConfigured()) {
     return res.status(503).json({
       success: false,
-      message: 'Payment service is currently unavailable. Please configure Stripe API keys.'
+      message: 'Payout service is currently unavailable. Please configure Stripe API keys.'
     });
   }
 
   const client = req.db;
   
   try {
-    // Verify the user is a service provider
-    if (req.user.role !== 'provider') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only service providers can access Connect dashboard'
-      });
-    }
-    
     // Get provider details
     const providerResult = await client.query(
       'SELECT * FROM service_providers WHERE user_id = $1',
@@ -325,16 +283,16 @@ const createLoginLink = async (req, res) => {
     
     const provider = providerResult.rows[0];
     
-    // Check if provider has a Connect account
-    if (!provider.stripe_connect_account_id) {
-      return res.status(400).json({
+    // Check if provider has a Stripe Connect account
+    if (!provider.stripe_account_id) {
+      return res.status(404).json({
         success: false,
-        message: 'Provider does not have a Connect account yet'
+        message: 'Provider does not have a Stripe Connect account'
       });
     }
     
-    // Create a login link for the Connect dashboard
-    const loginLink = await stripe.accounts.createLoginLink(provider.stripe_connect_account_id);
+    // Create a login link
+    const loginLink = await stripe.accounts.createLoginLink(provider.stripe_account_id);
     
     res.status(200).json({
       success: true,
@@ -353,136 +311,146 @@ const createLoginLink = async (req, res) => {
 };
 
 /**
- * Process a payout to a provider
- * @route POST /api/payments/connect/payout
+ * Process a payout to a service provider
+ * @route POST /api/payouts/process
  */
 const processPayout = async (req, res) => {
   // Check if Stripe is configured
   if (!isStripeConfigured()) {
     return res.status(503).json({
       success: false,
-      message: 'Payment service is currently unavailable. Please configure Stripe API keys.'
+      message: 'Payout service is currently unavailable. Please configure Stripe API keys.'
     });
   }
 
-  const { payment_id } = req.body;
+  const { payment_id, provider_id, amount } = req.body;
   const client = req.db;
   
   try {
     // Validate required fields
-    if (!payment_id) {
+    if (!payment_id || !provider_id) {
       return res.status(400).json({
         success: false,
-        message: 'Payment ID is required'
+        message: 'Payment ID and provider ID are required'
       });
     }
     
     // Start a transaction
     await client.query('BEGIN');
     
-    // Retrieve the payment from the database
-    const paymentResult = await client.query(`
-      SELECT p.*, 
-        sp.id as provider_id, 
-        sp.stripe_connect_account_id, 
-        sp.commission_rate,
-        sp.user_id as provider_user_id
-      FROM payments p
-      JOIN service_providers sp ON p.provider_id = sp.id
-      WHERE p.id = $1 AND p.status = 'completed'
-    `, [payment_id]);
+    // Get payment details
+    const paymentResult = await client.query(
+      'SELECT * FROM payments WHERE id = $1',
+      [payment_id]
+    );
     
     if (paymentResult.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({
         success: false,
-        message: 'Completed payment not found'
+        message: 'Payment not found'
       });
     }
     
     const payment = paymentResult.rows[0];
     
-    // Check if the provider has a Connect account
-    if (!payment.stripe_connect_account_id) {
+    // Verify payment status
+    if (payment.status !== 'completed') {
       await client.query('ROLLBACK');
       return res.status(400).json({
         success: false,
-        message: 'Provider does not have a Connect account set up'
+        message: `Cannot process payout for payment with status '${payment.status}'`
       });
     }
     
-    // Check if this payment has already been processed for payout
-    const existingPayoutResult = await client.query(
-      'SELECT * FROM provider_payouts WHERE payment_id = $1',
-      [payment_id]
+    // Verify provider ID matches payment
+    if (payment.provider_id !== parseInt(provider_id)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: 'Provider ID does not match payment'
+      });
+    }
+    
+    // Get provider details
+    const providerResult = await client.query(
+      'SELECT * FROM service_providers WHERE id = $1',
+      [provider_id]
     );
     
-    if (existingPayoutResult.rows.length > 0) {
+    if (providerResult.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(400).json({
+      return res.status(404).json({
         success: false,
-        message: 'This payment has already been processed for payout'
+        message: 'Provider not found'
       });
     }
     
-    // Calculate platform fee
-    const commissionRate = payment.commission_rate || 10; // Default to 10% if not set
-    const platformFee = (payment.amount * commissionRate) / 100;
-    const payoutAmount = payment.amount - platformFee;
+    const provider = providerResult.rows[0];
     
-    // Create a transfer to the provider's Connect account
+    // Check if provider has a Stripe Connect account
+    if (!provider.stripe_account_id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: 'Provider does not have a Stripe Connect account'
+      });
+    }
+    
+    // Calculate payout amount (payment amount minus platform fee)
+    // If amount is provided, use that instead
+    const payoutAmount = amount ? parseFloat(amount) : payment.amount * 0.8; // Default 20% platform fee
+    
+    // Create a transfer to the provider's Stripe account
     const transfer = await stripe.transfers.create({
-      amount: Math.round(payoutAmount * 100), // Convert to cents for Stripe
+      amount: Math.round(payoutAmount * 100), // Convert to cents
       currency: payment.currency || 'usd',
-      destination: payment.stripe_connect_account_id,
+      destination: provider.stripe_account_id,
       source_transaction: payment.stripe_payment_intent_id,
       description: `Payout for payment #${payment.id}`,
       metadata: {
         payment_id: payment.id,
-        provider_id: payment.provider_id,
-        platform_fee: platformFee,
-        original_amount: payment.amount
+        provider_id: provider.id,
+        platform_fee: (payment.amount - payoutAmount).toFixed(2)
       }
     });
     
     // Record the payout in the database
-    const payoutResult = await client.query(`
-      INSERT INTO provider_payouts (
+    const payoutResult = await client.query(
+      `INSERT INTO provider_payouts (
         provider_id,
         payment_id,
-        stripe_transfer_id,
+        stripe_payout_id,
         amount,
-        platform_fee,
-        original_amount,
-        currency,
         status,
-        payout_date,
-        description
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, $9)
-      RETURNING *
-    `, [
-      payment.provider_id,
-      payment.id,
-      transfer.id,
-      payoutAmount,
-      platformFee,
-      payment.amount,
-      payment.currency || 'usd',
-      'completed',
-      `Payout for payment #${payment.id}`
-    ]);
+        created_at,
+        updated_at
+      ) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      RETURNING *`,
+      [
+        provider_id,
+        payment_id,
+        transfer.id,
+        payoutAmount,
+        'pending'
+      ]
+    );
     
-    // Create notification for provider
-    await createNotification({
-      client,
-      user_id: payment.provider_user_id,
-      title: 'Payment Received',
-      message: `You have received a payment of ${payoutAmount.toFixed(2)} ${payment.currency || 'USD'} for service #${payment.service_request_id}`,
-      type: 'success',
-      related_to: 'payment',
-      related_id: payment.id
-    });
+    // Get user ID for notification
+    const userResult = await client.query(
+      'SELECT user_id FROM service_providers WHERE id = $1',
+      [provider_id]
+    );
+    
+    if (userResult.rows.length > 0) {
+      // Create notification for provider
+      await createPaymentNotification(
+        client,
+        payment.id,
+        userResult.rows[0].user_id,
+        'payout_processed'
+      );
+    }
     
     // Commit the transaction
     await client.query('COMMIT');
@@ -494,10 +462,7 @@ const processPayout = async (req, res) => {
         payout_id: payoutResult.rows[0].id,
         transfer_id: transfer.id,
         amount: payoutAmount,
-        platform_fee: platformFee,
-        original_amount: payment.amount,
-        currency: payment.currency || 'usd',
-        status: 'completed'
+        status: 'pending'
       }
     });
   } catch (error) {
@@ -514,8 +479,8 @@ const processPayout = async (req, res) => {
 };
 
 /**
- * Get provider payout history
- * @route GET /api/payments/connect/payouts
+ * Get payout history for a provider
+ * @route GET /api/payouts/history
  */
 const getPayoutHistory = async (req, res) => {
   const client = req.db;
@@ -544,15 +509,19 @@ const getPayoutHistory = async (req, res) => {
       query = `
         SELECT 
           pp.*,
-          p.service_request_id,
+          p.stripe_payment_intent_id,
+          p.amount as payment_amount,
           sr.description as service_description,
           s.name as service_name,
-          prop.address as property_address
+          h.user_id as homeowner_user_id,
+          u.first_name as homeowner_first_name,
+          u.last_name as homeowner_last_name
         FROM provider_payouts pp
         JOIN payments p ON pp.payment_id = p.id
         JOIN service_requests sr ON p.service_request_id = sr.id
         JOIN services s ON sr.service_id = s.id
-        JOIN properties prop ON sr.property_id = prop.id
+        JOIN homeowners h ON p.homeowner_id = h.id
+        JOIN users u ON h.user_id = u.id
         WHERE pp.provider_id = $1
         ORDER BY pp.created_at DESC
       `;
@@ -563,17 +532,21 @@ const getPayoutHistory = async (req, res) => {
       query = `
         SELECT 
           pp.*,
-          p.service_request_id,
+          p.stripe_payment_intent_id,
+          p.amount as payment_amount,
           sr.description as service_description,
           s.name as service_name,
-          prop.address as property_address,
-          sp.company_name as provider_name
+          sp.company_name as provider_name,
+          h.user_id as homeowner_user_id,
+          u.first_name as homeowner_first_name,
+          u.last_name as homeowner_last_name
         FROM provider_payouts pp
         JOIN payments p ON pp.payment_id = p.id
         JOIN service_requests sr ON p.service_request_id = sr.id
         JOIN services s ON sr.service_id = s.id
-        JOIN properties prop ON sr.property_id = prop.id
         JOIN service_providers sp ON pp.provider_id = sp.id
+        JOIN homeowners h ON p.homeowner_id = h.id
+        JOIN users u ON h.user_id = u.id
         ORDER BY pp.created_at DESC
         LIMIT 100
       `;
@@ -603,7 +576,7 @@ const getPayoutHistory = async (req, res) => {
 
 /**
  * Get a single payout by ID
- * @route GET /api/payments/connect/payouts/:id
+ * @route GET /api/payouts/:id
  */
 const getPayoutById = async (req, res) => {
   const { id } = req.params;
@@ -614,18 +587,22 @@ const getPayoutById = async (req, res) => {
     const payoutResult = await client.query(`
       SELECT 
         pp.*,
-        p.service_request_id,
-        sr.description as service_description, sr.status as service_status,
+        p.stripe_payment_intent_id,
+        p.amount as payment_amount,
+        sr.description as service_description,
         s.name as service_name,
-        prop.address as property_address,
         sp.company_name as provider_name,
-        sp.user_id as provider_user_id
+        sp.user_id as provider_user_id,
+        h.user_id as homeowner_user_id,
+        u.first_name as homeowner_first_name,
+        u.last_name as homeowner_last_name
       FROM provider_payouts pp
       JOIN payments p ON pp.payment_id = p.id
       JOIN service_requests sr ON p.service_request_id = sr.id
       JOIN services s ON sr.service_id = s.id
-      JOIN properties prop ON sr.property_id = prop.id
       JOIN service_providers sp ON pp.provider_id = sp.id
+      JOIN homeowners h ON p.homeowner_id = h.id
+      JOIN users u ON h.user_id = u.id
       WHERE pp.id = $1
     `, [id]);
     
@@ -646,6 +623,25 @@ const getPayoutById = async (req, res) => {
       });
     }
     
+    // If the payout has a Stripe ID, get additional details from Stripe
+    if (isStripeConfigured() && payout.stripe_payout_id) {
+      try {
+        const transfer = await stripe.transfers.retrieve(payout.stripe_payout_id);
+        payout.stripe_details = {
+          created: transfer.created,
+          amount: transfer.amount / 100, // Convert from cents
+          currency: transfer.currency,
+          description: transfer.description,
+          destination: transfer.destination,
+          destination_payment: transfer.destination_payment,
+          source_transaction: transfer.source_transaction
+        };
+      } catch (stripeError) {
+        console.warn('Could not retrieve Stripe transfer details:', stripeError);
+        // Continue without the Stripe details
+      }
+    }
+    
     res.status(200).json({
       success: true,
       data: payout
@@ -662,14 +658,14 @@ const getPayoutById = async (req, res) => {
 
 /**
  * Handle Stripe Connect webhook events
- * @route POST /api/payments/connect/webhook
+ * @route POST /api/payouts/webhook
  */
 const handleConnectWebhook = async (req, res) => {
   // Check if Stripe is configured
   if (!isStripeConfigured()) {
     return res.status(503).json({
       success: false,
-      message: 'Payment service is currently unavailable. Please configure Stripe API keys.'
+      message: 'Payout service is currently unavailable. Please configure Stripe API keys.'
     });
   }
 
@@ -689,38 +685,32 @@ const handleConnectWebhook = async (req, res) => {
       case 'account.updated': {
         const account = event.data.object;
         
-        // Update the provider's onboarding status if details are submitted
-        if (account.details_submitted) {
-          await client.query(`
-            UPDATE service_providers 
-            SET 
-              stripe_connect_onboarded = $1, 
-              stripe_connect_onboarding_date = CASE WHEN $1 = true AND stripe_connect_onboarding_date IS NULL THEN CURRENT_TIMESTAMP ELSE stripe_connect_onboarding_date END 
-            WHERE stripe_connect_account_id = $2
-          `, [account.details_submitted && account.payouts_enabled, account.id]);
-          
-          // Get the provider to send a notification
-          const providerResult = await client.query(
-            'SELECT * FROM service_providers WHERE stripe_connect_account_id = $1',
-            [account.id]
+        // Update the provider's account status in the database
+        await client.query(`
+          UPDATE service_providers
+          SET 
+            is_verified = $1,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE stripe_account_id = $2
+        `, [
+          account.details_submitted && account.charges_enabled && account.payouts_enabled,
+          account.id
+        ]);
+        
+        // Get the provider to send notification
+        const providerResult = await client.query(
+          'SELECT user_id FROM service_providers WHERE stripe_account_id = $1',
+          [account.id]
+        );
+        
+        if (providerResult.rows.length > 0) {
+          // Create notification for account update
+          await createPaymentNotification(
+            client,
+            null, // No payment ID for this notification
+            providerResult.rows[0].user_id,
+            'account_updated'
           );
-          
-          if (providerResult.rows.length > 0) {
-            const provider = providerResult.rows[0];
-            
-            // Create notification for provider
-            if (account.details_submitted && account.payouts_enabled) {
-              await createNotification({
-                client,
-                user_id: provider.user_id,
-                title: 'Stripe Connect Onboarding Complete',
-                message: 'Your Stripe Connect account has been successfully set up. You can now receive payments for your services.',
-                type: 'success',
-                related_to: 'provider',
-                related_id: provider.id
-              });
-            }
-          }
         }
         break;
       }
@@ -735,8 +725,11 @@ const handleConnectWebhook = async (req, res) => {
             SET 
               status = 'processing',
               updated_at = CURRENT_TIMESTAMP
-            WHERE payment_id = $1 AND stripe_transfer_id = $2
-          `, [transfer.metadata.payment_id, transfer.id]);
+            WHERE payment_id = $1 AND stripe_payout_id = $2
+          `, [
+            transfer.metadata.payment_id,
+            transfer.id
+          ]);
         }
         break;
       }
@@ -751,29 +744,27 @@ const handleConnectWebhook = async (req, res) => {
             SET 
               status = 'completed',
               updated_at = CURRENT_TIMESTAMP
-            WHERE payment_id = $1 AND stripe_transfer_id = $2
-          `, [transfer.metadata.payment_id, transfer.id]);
+            WHERE payment_id = $1 AND stripe_payout_id = $2
+          `, [
+            transfer.metadata.payment_id,
+            transfer.id
+          ]);
           
-          // Get the provider to send a notification
+          // Get the provider to send notification
           if (transfer.metadata.provider_id) {
             const providerResult = await client.query(
-              'SELECT * FROM service_providers WHERE id = $1',
+              'SELECT user_id FROM service_providers WHERE id = $1',
               [transfer.metadata.provider_id]
             );
             
             if (providerResult.rows.length > 0) {
-              const provider = providerResult.rows[0];
-              
-              // Create notification for provider
-              await createNotification({
+              // Create notification for successful payout
+              await createPaymentNotification(
                 client,
-                user_id: provider.user_id,
-                title: 'Payout Completed',
-                message: `Your payout of ${(transfer.amount / 100).toFixed(2)} ${transfer.currency.toUpperCase()} has been sent to your bank account.`,
-                type: 'success',
-                related_to: 'payment',
-                related_id: transfer.metadata.payment_id
-              });
+                transfer.metadata.payment_id,
+                providerResult.rows[0].user_id,
+                'payout_completed'
+              );
             }
           }
         }
@@ -790,29 +781,27 @@ const handleConnectWebhook = async (req, res) => {
             SET 
               status = 'failed',
               updated_at = CURRENT_TIMESTAMP
-            WHERE payment_id = $1 AND stripe_transfer_id = $2
-          `, [transfer.metadata.payment_id, transfer.id]);
+            WHERE payment_id = $1 AND stripe_payout_id = $2
+          `, [
+            transfer.metadata.payment_id,
+            transfer.id
+          ]);
           
-          // Get the provider to send a notification
+          // Get the provider to send notification
           if (transfer.metadata.provider_id) {
             const providerResult = await client.query(
-              'SELECT * FROM service_providers WHERE id = $1',
+              'SELECT user_id FROM service_providers WHERE id = $1',
               [transfer.metadata.provider_id]
             );
             
             if (providerResult.rows.length > 0) {
-              const provider = providerResult.rows[0];
-              
-              // Create notification for provider
-              await createNotification({
+              // Create notification for failed payout
+              await createPaymentNotification(
                 client,
-                user_id: provider.user_id,
-                title: 'Payout Failed',
-                message: `Your payout of ${(transfer.amount / 100).toFixed(2)} ${transfer.currency.toUpperCase()} has failed. Please check your Stripe Connect account for more details.`,
-                type: 'error',
-                related_to: 'payment',
-                related_id: transfer.metadata.payment_id
-              });
+                transfer.metadata.payment_id,
+                providerResult.rows[0].user_id,
+                'payout_failed'
+              );
             }
           }
         }
@@ -824,7 +813,7 @@ const handleConnectWebhook = async (req, res) => {
     
     res.status(200).json({ received: true });
   } catch (error) {
-    console.error('Connect webhook error:', error);
+    console.error('Webhook error:', error);
     return res.status(400).send(`Webhook Error: ${error.message}`);
   }
 };
