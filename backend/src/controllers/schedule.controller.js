@@ -303,25 +303,24 @@ const deleteScheduleItem = async (req, res) => {
 };
 
 /**
- * Get all recurring patterns for current user
- * @route GET /api/schedule/recurring/patterns
+ * Get all recurring schedule patterns for current user
+ * @route GET /api/schedule/recurring
  */
-const getUserRecurringPatterns = async (req, res) => {
+const getRecurringSchedules = async (req, res) => {
   const client = req.db;
   const userId = req.user.id;
   
   try {
-    // Get all recurring patterns for this user
+    // Get all recurring schedules for this user
     const result = await client.query(`
-      SELECT rs.*, 
-        sr.title as service_request_title,
+      SELECT rs.*, sr.title, sr.description, 
         p.address as property_address, p.city as property_city, 
         p.state as property_state, p.zip_code as property_zip_code
       FROM recurring_schedules rs
-      LEFT JOIN service_requests sr ON rs.service_request_id = sr.id
+      JOIN service_requests sr ON rs.service_request_id = sr.id
       LEFT JOIN properties p ON sr.property_id = p.id
-      WHERE sr.homeowner_id = $1 OR sr.provider_id = $1
-      ORDER BY rs.created_at DESC
+      WHERE sr.homeowner_id = $1
+      ORDER BY rs.next_run ASC
     `, [userId]);
     
     res.status(200).json({
@@ -330,33 +329,32 @@ const getUserRecurringPatterns = async (req, res) => {
       data: result.rows
     });
   } catch (error) {
-    console.error('Error getting recurring patterns:', error);
+    console.error('Error getting recurring schedules:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching recurring patterns',
+      message: 'Error fetching recurring schedules',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 };
 
 /**
- * Get recurring pattern by ID
- * @route GET /api/schedule/recurring/patterns/:id
+ * Get recurring schedule pattern by ID
+ * @route GET /api/schedule/recurring/:id
  */
-const getRecurringPatternById = async (req, res) => {
+const getRecurringScheduleById = async (req, res) => {
   const { id } = req.params;
   const client = req.db;
   const userId = req.user.id;
   
   try {
-    // Get the recurring pattern
+    // Get the recurring schedule
     const result = await client.query(`
-      SELECT rs.*, 
-        sr.title as service_request_title,
+      SELECT rs.*, sr.title, sr.description, 
         p.address as property_address, p.city as property_city, 
         p.state as property_state, p.zip_code as property_zip_code
       FROM recurring_schedules rs
-      LEFT JOIN service_requests sr ON rs.service_request_id = sr.id
+      JOIN service_requests sr ON rs.service_request_id = sr.id
       LEFT JOIN properties p ON sr.property_id = p.id
       WHERE rs.id = $1
     `, [id]);
@@ -364,118 +362,126 @@ const getRecurringPatternById = async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
-        message: 'Recurring pattern not found'
+        message: 'Recurring schedule not found'
       });
     }
     
-    const pattern = result.rows[0];
+    const recurringSchedule = result.rows[0];
     
-    // Check if user is authorized to access this pattern
-    const authCheck = await client.query(`
-      SELECT id FROM service_requests 
-      WHERE id = $1 AND (homeowner_id = $2 OR provider_id = $2)
-    `, [pattern.service_request_id, userId]);
-    
-    if (req.user.role !== 'admin' && authCheck.rows.length === 0) {
+    // Check if user is authorized to access this recurring schedule
+    if (req.user.role !== 'admin' && recurringSchedule.homeowner_id !== userId) {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to access this recurring pattern'
+        message: 'Not authorized to access this recurring schedule'
       });
     }
     
     res.status(200).json({
       success: true,
-      data: pattern
+      data: recurringSchedule
     });
   } catch (error) {
-    console.error('Error getting recurring pattern:', error);
+    console.error('Error getting recurring schedule:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching recurring pattern',
+      message: 'Error fetching recurring schedule',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 };
 
 /**
- * Create new recurring pattern
- * @route POST /api/schedule/recurring/patterns
+ * Create new recurring schedule pattern
+ * @route POST /api/schedule/recurring
  */
-const createRecurringPattern = async (req, res) => {
+const createRecurringSchedule = async (req, res) => {
   const { 
     serviceRequestId, 
-    rrulePattern,
+    rrulePattern, 
     startDate,
     endDate,
-    frequency,
+    count,
     interval,
+    frequency,
     byweekday,
     bymonthday,
     bysetpos,
-    count,
-    until,
     exceptions
   } = req.body;
   const client = req.db;
   const userId = req.user.id;
   
   try {
-    // Check if service request exists and user has access to it
-    const serviceCheck = await client.query(`
-      SELECT id, homeowner_id, provider_id FROM service_requests 
+    // Validate service request exists and belongs to this user
+    const serviceRequestCheck = await client.query(`
+      SELECT * FROM service_requests
       WHERE id = $1
     `, [serviceRequestId]);
     
-    if (serviceCheck.rows.length === 0) {
+    if (serviceRequestCheck.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Service request not found'
       });
     }
     
-    const serviceRequest = serviceCheck.rows[0];
+    const serviceRequest = serviceRequestCheck.rows[0];
     
-    // Check if user is authorized to create a pattern for this service request
-    if (req.user.role !== 'admin' && 
-        serviceRequest.homeowner_id !== userId && 
-        serviceRequest.provider_id !== userId) {
+    // Check if user is authorized to create a recurring schedule for this service request
+    if (req.user.role !== 'admin' && serviceRequest.homeowner_id !== userId) {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to create a recurring pattern for this service request'
+        message: 'Not authorized to create a recurring schedule for this service request'
       });
     }
     
-    // If rrulePattern is provided directly, use it
-    // Otherwise, construct it from the individual parameters
+    // Generate RRule pattern if not provided directly
     let finalRrulePattern = rrulePattern;
-    
     if (!finalRrulePattern) {
       // Import RRule library
       const { RRule } = require('rrule');
       
-      // Create RRule options object
+      // Map frequency string to RRule constant
+      const freqMap = {
+        'daily': RRule.DAILY,
+        'weekly': RRule.WEEKLY,
+        'monthly': RRule.MONTHLY,
+        'yearly': RRule.YEARLY
+      };
+      
+      // Map weekday strings to RRule constants if provided
+      let byweekdayArray = null;
+      if (byweekday) {
+        const weekdayMap = {
+          'mo': RRule.MO,
+          'tu': RRule.TU,
+          'we': RRule.WE,
+          'th': RRule.TH,
+          'fr': RRule.FR,
+          'sa': RRule.SA,
+          'su': RRule.SU
+        };
+        
+        byweekdayArray = Array.isArray(byweekday) 
+          ? byweekday.map(day => weekdayMap[day.toLowerCase()])
+          : [weekdayMap[byweekday.toLowerCase()]];
+      }
+      
+      // Create RRule options
       const rruleOptions = {
-        freq: frequency ? RRule[frequency.toUpperCase()] : RRule.WEEKLY,
+        freq: freqMap[frequency.toLowerCase()],
         interval: interval || 1,
-        dtstart: startDate ? new Date(startDate) : new Date(),
+        dtstart: new Date(startDate),
       };
       
       // Add optional parameters if provided
-      if (byweekday) {
-        rruleOptions.byweekday = Array.isArray(byweekday) 
-          ? byweekday.map(day => RRule[day.toUpperCase()]) 
-          : [RRule[byweekday.toUpperCase()]];
-      }
-      
+      if (count) rruleOptions.count = count;
+      if (endDate) rruleOptions.until = new Date(endDate);
+      if (byweekdayArray) rruleOptions.byweekday = byweekdayArray;
       if (bymonthday) rruleOptions.bymonthday = bymonthday;
       if (bysetpos) rruleOptions.bysetpos = bysetpos;
       
-      // Handle end conditions
-      if (count) rruleOptions.count = count;
-      else if (until) rruleOptions.until = new Date(until);
-      else if (endDate) rruleOptions.until = new Date(endDate);
-      
-      // Create RRule instance and get string representation
+      // Create RRule and get string representation
       const rule = new RRule(rruleOptions);
       finalRrulePattern = rule.toString();
     }
@@ -483,136 +489,170 @@ const createRecurringPattern = async (req, res) => {
     // Calculate next run date
     const { RRule } = require('rrule');
     const rule = RRule.fromString(finalRrulePattern);
-    const nextRun = rule.after(new Date());
+    const nextRun = rule.after(new Date(), true);
     
-    // Begin transaction
-    await client.query('BEGIN');
-    
-    // Create the recurring pattern
-    const patternResult = await client.query(`
+    // Create the recurring schedule
+    const result = await client.query(`
       INSERT INTO recurring_schedules 
         (service_request_id, rrule_pattern, next_run, created_at, updated_at)
       VALUES ($1, $2, $3, NOW(), NOW())
       RETURNING *
-    `, [serviceRequestId, finalRrulePattern, nextRun]);
+    `, [
+      serviceRequestId, finalRrulePattern, nextRun
+    ]);
     
-    const newPattern = patternResult.rows[0];
-    
-    // Add exceptions if provided
-    if (exceptions && Array.isArray(exceptions) && exceptions.length > 0) {
+    // Store exceptions if provided
+    if (exceptions && exceptions.length > 0) {
       for (const exceptionDate of exceptions) {
         await client.query(`
-          INSERT INTO recurring_schedule_exceptions 
-            (recurring_schedule_id, exception_date, created_at)
-          VALUES ($1, $2, NOW())
-        `, [newPattern.id, new Date(exceptionDate)]);
+          INSERT INTO schedule_exceptions 
+            (recurring_schedule_id, exception_date, created_at, updated_at)
+          VALUES ($1, $2, NOW(), NOW())
+        `, [result.rows[0].id, new Date(exceptionDate)]);
       }
     }
     
-    // Commit transaction
-    await client.query('COMMIT');
+    // Generate initial schedule items
+    await generateScheduleItems(client, result.rows[0].id, userId);
     
-    // Get the complete pattern with exceptions
+    // Get the complete recurring schedule with exceptions
     const completeResult = await client.query(`
       SELECT rs.*, 
-        (SELECT json_agg(exception_date) 
-         FROM recurring_schedule_exceptions 
-         WHERE recurring_schedule_id = rs.id) as exceptions
+        (SELECT json_agg(exception_date) FROM schedule_exceptions WHERE recurring_schedule_id = rs.id) as exceptions
       FROM recurring_schedules rs
       WHERE rs.id = $1
-    `, [newPattern.id]);
+    `, [result.rows[0].id]);
     
     res.status(201).json({
       success: true,
-      message: 'Recurring pattern created successfully',
+      message: 'Recurring schedule created successfully',
       data: completeResult.rows[0]
     });
   } catch (error) {
-    // Rollback transaction on error
-    await client.query('ROLLBACK');
-    
-    console.error('Error creating recurring pattern:', error);
+    console.error('Error creating recurring schedule:', error);
     res.status(500).json({
       success: false,
-      message: 'Error creating recurring pattern',
+      message: 'Error creating recurring schedule',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 };
 
 /**
- * Update recurring pattern
- * @route PUT /api/schedule/recurring/patterns/:id
+ * Update recurring schedule pattern
+ * @route PUT /api/schedule/recurring/:id
  */
-const updateRecurringPattern = async (req, res) => {
+const updateRecurringSchedule = async (req, res) => {
   const { id } = req.params;
   const { 
-    rrulePattern,
+    rrulePattern, 
     startDate,
     endDate,
-    frequency,
+    count,
     interval,
+    frequency,
     byweekday,
     bymonthday,
     bysetpos,
-    count,
-    until
+    exceptions,
+    applyToFuture
   } = req.body;
   const client = req.db;
   const userId = req.user.id;
   
   try {
-    // Check if pattern exists
-    const patternCheck = await client.query(`
-      SELECT rs.*, sr.homeowner_id, sr.provider_id 
+    // Begin transaction
+    await client.query('BEGIN');
+    
+    // Check if recurring schedule exists
+    const checkResult = await client.query(`
+      SELECT rs.*, sr.homeowner_id 
       FROM recurring_schedules rs
       JOIN service_requests sr ON rs.service_request_id = sr.id
       WHERE rs.id = $1
     `, [id]);
     
-    if (patternCheck.rows.length === 0) {
+    if (checkResult.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({
         success: false,
-        message: 'Recurring pattern not found'
+        message: 'Recurring schedule not found'
       });
     }
     
-    const pattern = patternCheck.rows[0];
+    const recurringSchedule = checkResult.rows[0];
     
-    // Check if user is authorized to update this pattern
-    if (req.user.role !== 'admin' && 
-        pattern.homeowner_id !== userId && 
-        pattern.provider_id !== userId) {
+    // Check if user is authorized to update this recurring schedule
+    if (req.user.role !== 'admin' && recurringSchedule.homeowner_id !== userId) {
+      await client.query('ROLLBACK');
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to update this recurring pattern'
+        message: 'Not authorized to update this recurring schedule'
       });
     }
     
-    // If rrulePattern is provided directly, use it
-    // Otherwise, construct it from the individual parameters
+    // Generate RRule pattern if not provided directly
     let finalRrulePattern = rrulePattern;
-    
-    if (!finalRrulePattern && (frequency || interval || byweekday || bymonthday || bysetpos || count || until || startDate || endDate)) {
+    if (!finalRrulePattern && (frequency || interval || startDate || endDate || count || byweekday || bymonthday || bysetpos)) {
       // Import RRule library
       const { RRule } = require('rrule');
       
-      // Get existing rule to use as base
-      const existingRule = RRule.fromString(pattern.rrule_pattern);
+      // Parse existing rule to get current values
+      const existingRule = RRule.fromString(recurringSchedule.rrule_pattern);
       const existingOptions = existingRule.options;
       
-      // Create RRule options object, starting with existing options
+      // Map frequency string to RRule constant if provided
+      let freq = existingOptions.freq;
+      if (frequency) {
+        const freqMap = {
+          'daily': RRule.DAILY,
+          'weekly': RRule.WEEKLY,
+          'monthly': RRule.MONTHLY,
+          'yearly': RRule.YEARLY
+        };
+        freq = freqMap[frequency.toLowerCase()];
+      }
+      
+      // Map weekday strings to RRule constants if provided
+      let byweekdayArray = existingOptions.byweekday;
+      if (byweekday) {
+        const weekdayMap = {
+          'mo': RRule.MO,
+          'tu': RRule.TU,
+          'we': RRule.WE,
+          'th': RRule.TH,
+          'fr': RRule.FR,
+          'sa': RRule.SA,
+          'su': RRule.SU
+        };
+        
+        byweekdayArray = Array.isArray(byweekday) 
+          ? byweekday.map(day => weekdayMap[day.toLowerCase()])
+          : [weekdayMap[byweekday.toLowerCase()]];
+      }
+      
+      // Create RRule options with existing values as defaults
       const rruleOptions = {
-        freq: frequency ? RRule[frequency.toUpperCase()] : existingOptions.freq,
+        freq: freq,
         interval: interval || existingOptions.interval,
         dtstart: startDate ? new Date(startDate) : existingOptions.dtstart,
       };
       
       // Add optional parameters if provided or use existing
-      if (byweekday) {
-        rruleOptions.byweekday = Array.isArray(byweekday) 
-          ? byweekday.map(day => RRule[day.toUpperCase()]) 
-          : [RRule[byweekday.toUpperCase()]];
+      if (count) {
+        rruleOptions.count = count;
+      } else if (existingOptions.count) {
+        rruleOptions.count = existingOptions.count;
+      }
+      
+      if (endDate) {
+        rruleOptions.until = new Date(endDate);
+      } else if (existingOptions.until) {
+        rruleOptions.until = existingOptions.until;
+      }
+      
+      if (byweekdayArray) {
+        rruleOptions.byweekday = byweekdayArray;
       } else if (existingOptions.byweekday) {
         rruleOptions.byweekday = existingOptions.byweekday;
       }
@@ -629,117 +669,161 @@ const updateRecurringPattern = async (req, res) => {
         rruleOptions.bysetpos = existingOptions.bysetpos;
       }
       
-      // Handle end conditions - only one can be active
-      if (count) {
-        rruleOptions.count = count;
-      } else if (until) {
-        rruleOptions.until = new Date(until);
-      } else if (endDate) {
-        rruleOptions.until = new Date(endDate);
-      } else if (existingOptions.count) {
-        rruleOptions.count = existingOptions.count;
-      } else if (existingOptions.until) {
-        rruleOptions.until = existingOptions.until;
-      }
-      
-      // Create RRule instance and get string representation
+      // Create RRule and get string representation
       const rule = new RRule(rruleOptions);
       finalRrulePattern = rule.toString();
     }
     
-    // If no changes to the pattern, use the existing one
-    if (!finalRrulePattern) {
-      finalRrulePattern = pattern.rrule_pattern;
+    // Calculate next run date if pattern changed
+    let nextRun = recurringSchedule.next_run;
+    if (finalRrulePattern && finalRrulePattern !== recurringSchedule.rrule_pattern) {
+      const { RRule } = require('rrule');
+      const rule = RRule.fromString(finalRrulePattern);
+      nextRun = rule.after(new Date(), true);
     }
     
-    // Calculate next run date
-    const { RRule } = require('rrule');
-    const rule = RRule.fromString(finalRrulePattern);
-    const nextRun = rule.after(new Date());
+    // Update the recurring schedule
+    const updateFields = [];
+    const updateValues = [];
+    let valueIndex = 1;
     
-    // Update the recurring pattern
-    const updateResult = await client.query(`
-      UPDATE recurring_schedules
-      SET 
-        rrule_pattern = $1,
-        next_run = $2,
-        updated_at = NOW()
-      WHERE id = $3
-      RETURNING *
-    `, [finalRrulePattern, nextRun, id]);
+    if (finalRrulePattern) {
+      updateFields.push(`rrule_pattern = $${valueIndex}`);
+      updateValues.push(finalRrulePattern);
+      valueIndex++;
+    }
     
-    // Get the complete pattern with exceptions
+    if (nextRun) {
+      updateFields.push(`next_run = $${valueIndex}`);
+      updateValues.push(nextRun);
+      valueIndex++;
+    }
+    
+    updateFields.push(`updated_at = NOW()`);
+    
+    if (updateFields.length > 1) { // More than just updated_at
+      const result = await client.query(`
+        UPDATE recurring_schedules
+        SET ${updateFields.join(', ')}
+        WHERE id = $${valueIndex}
+        RETURNING *
+      `, [...updateValues, id]);
+      
+      // Handle exceptions if provided
+      if (exceptions) {
+        // Delete existing exceptions
+        await client.query(`
+          DELETE FROM schedule_exceptions
+          WHERE recurring_schedule_id = $1
+        `, [id]);
+        
+        // Add new exceptions
+        for (const exceptionDate of exceptions) {
+          await client.query(`
+            INSERT INTO schedule_exceptions 
+              (recurring_schedule_id, exception_date, created_at, updated_at)
+            VALUES ($1, $2, NOW(), NOW())
+          `, [id, new Date(exceptionDate)]);
+        }
+      }
+      
+      // Handle future occurrences if pattern changed
+      if (applyToFuture && finalRrulePattern && finalRrulePattern !== recurringSchedule.rrule_pattern) {
+        // Delete future schedule items
+        await client.query(`
+          DELETE FROM schedule_items
+          WHERE recurrence_parent_id = $1 AND date > NOW()
+        `, [id]);
+        
+        // Generate new schedule items
+        await generateScheduleItems(client, id, userId);
+      }
+    }
+    
+    // Commit transaction
+    await client.query('COMMIT');
+    
+    // Get the updated recurring schedule with exceptions
     const completeResult = await client.query(`
       SELECT rs.*, 
-        (SELECT json_agg(exception_date) 
-         FROM recurring_schedule_exceptions 
-         WHERE recurring_schedule_id = rs.id) as exceptions
+        (SELECT json_agg(exception_date) FROM schedule_exceptions WHERE recurring_schedule_id = rs.id) as exceptions
       FROM recurring_schedules rs
       WHERE rs.id = $1
     `, [id]);
     
     res.status(200).json({
       success: true,
-      message: 'Recurring pattern updated successfully',
+      message: 'Recurring schedule updated successfully',
       data: completeResult.rows[0]
     });
   } catch (error) {
-    console.error('Error updating recurring pattern:', error);
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    console.error('Error updating recurring schedule:', error);
     res.status(500).json({
       success: false,
-      message: 'Error updating recurring pattern',
+      message: 'Error updating recurring schedule',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 };
 
 /**
- * Delete recurring pattern
- * @route DELETE /api/schedule/recurring/patterns/:id
+ * Delete recurring schedule pattern
+ * @route DELETE /api/schedule/recurring/:id
  */
-const deleteRecurringPattern = async (req, res) => {
+const deleteRecurringSchedule = async (req, res) => {
   const { id } = req.params;
+  const { deleteFutureItems } = req.query;
   const client = req.db;
   const userId = req.user.id;
   
   try {
-    // Check if pattern exists
-    const patternCheck = await client.query(`
-      SELECT rs.*, sr.homeowner_id, sr.provider_id 
+    // Begin transaction
+    await client.query('BEGIN');
+    
+    // Check if recurring schedule exists
+    const checkResult = await client.query(`
+      SELECT rs.*, sr.homeowner_id 
       FROM recurring_schedules rs
       JOIN service_requests sr ON rs.service_request_id = sr.id
       WHERE rs.id = $1
     `, [id]);
     
-    if (patternCheck.rows.length === 0) {
+    if (checkResult.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({
         success: false,
-        message: 'Recurring pattern not found'
+        message: 'Recurring schedule not found'
       });
     }
     
-    const pattern = patternCheck.rows[0];
+    const recurringSchedule = checkResult.rows[0];
     
-    // Check if user is authorized to delete this pattern
-    if (req.user.role !== 'admin' && 
-        pattern.homeowner_id !== userId && 
-        pattern.provider_id !== userId) {
+    // Check if user is authorized to delete this recurring schedule
+    if (req.user.role !== 'admin' && recurringSchedule.homeowner_id !== userId) {
+      await client.query('ROLLBACK');
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to delete this recurring pattern'
+        message: 'Not authorized to delete this recurring schedule'
       });
     }
     
-    // Begin transaction
-    await client.query('BEGIN');
-    
-    // Delete all exceptions for this pattern
+    // Delete associated exceptions
     await client.query(`
-      DELETE FROM recurring_schedule_exceptions
+      DELETE FROM schedule_exceptions
       WHERE recurring_schedule_id = $1
     `, [id]);
     
-    // Delete the recurring pattern
+    // Delete future schedule items if requested
+    if (deleteFutureItems === 'true') {
+      await client.query(`
+        DELETE FROM schedule_items
+        WHERE recurrence_parent_id = $1 AND date > NOW()
+      `, [id]);
+    }
+    
+    // Delete the recurring schedule
     await client.query(`
       DELETE FROM recurring_schedules
       WHERE id = $1
@@ -750,16 +834,15 @@ const deleteRecurringPattern = async (req, res) => {
     
     res.status(200).json({
       success: true,
-      message: 'Recurring pattern deleted successfully'
+      message: 'Recurring schedule deleted successfully'
     });
   } catch (error) {
     // Rollback transaction on error
     await client.query('ROLLBACK');
-    
-    console.error('Error deleting recurring pattern:', error);
+    console.error('Error deleting recurring schedule:', error);
     res.status(500).json({
       success: false,
-      message: 'Error deleting recurring pattern',
+      message: 'Error deleting recurring schedule',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -767,501 +850,238 @@ const deleteRecurringPattern = async (req, res) => {
 
 /**
  * Generate schedule items from recurring pattern
- * @route POST /api/schedule/recurring/generate/:patternId
+ * @route POST /api/schedule/recurring/:id/generate
  */
-const generateScheduleFromPattern = async (req, res) => {
-  const { patternId } = req.params;
-  const { startDate, endDate, limit } = req.body;
+const generateScheduleItemsFromPattern = async (req, res) => {
+  const { id } = req.params;
+  const { count } = req.body;
   const client = req.db;
   const userId = req.user.id;
   
   try {
-    // Check if pattern exists
-    const patternCheck = await client.query(`
-      SELECT rs.*, sr.* 
+    // Check if recurring schedule exists
+    const checkResult = await client.query(`
+      SELECT rs.*, sr.homeowner_id, sr.id as service_request_id 
       FROM recurring_schedules rs
       JOIN service_requests sr ON rs.service_request_id = sr.id
       WHERE rs.id = $1
-    `, [patternId]);
+    `, [id]);
     
-    if (patternCheck.rows.length === 0) {
+    if (checkResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
-        message: 'Recurring pattern not found'
+        message: 'Recurring schedule not found'
       });
     }
     
-    const pattern = patternCheck.rows[0];
+    const recurringSchedule = checkResult.rows[0];
     
-    // Check if user is authorized to generate schedules from this pattern
-    if (req.user.role !== 'admin' && 
-        pattern.homeowner_id !== userId && 
-        pattern.provider_id !== userId) {
+    // Check if user is authorized to generate schedule items for this recurring schedule
+    if (req.user.role !== 'admin' && recurringSchedule.homeowner_id !== userId) {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to generate schedules from this pattern'
+        message: 'Not authorized to generate schedule items for this recurring schedule'
       });
     }
     
-    // Get exceptions for this pattern
-    const exceptionsResult = await client.query(`
-      SELECT exception_date 
-      FROM recurring_schedule_exceptions 
-      WHERE recurring_schedule_id = $1
-    `, [patternId]);
+    // Generate schedule items
+    const generatedItems = await generateScheduleItems(client, id, userId, count);
     
-    const exceptions = exceptionsResult.rows.map(row => new Date(row.exception_date));
-    
-    // Import RRule library
-    const { RRule, RRuleSet } = require('rrule');
-    
-    // Create RRuleSet to handle both the rule and exceptions
-    const rruleSet = new RRuleSet();
-    
-    // Add the main rule
-    rruleSet.rrule(RRule.fromString(pattern.rrule_pattern));
-    
-    // Add exceptions
-    exceptions.forEach(exceptionDate => {
-      rruleSet.exdate(exceptionDate);
+    res.status(200).json({
+      success: true,
+      message: `${generatedItems.length} schedule items generated successfully`,
+      data: generatedItems
     });
+  } catch (error) {
+    console.error('Error generating schedule items:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating schedule items',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Helper function to generate schedule items from a recurring pattern
+ * @param {Object} client - Database client
+ * @param {number} recurringScheduleId - ID of the recurring schedule
+ * @param {number} userId - ID of the user
+ * @param {number} count - Number of occurrences to generate (default: 4)
+ * @returns {Array} Generated schedule items
+ */
+const generateScheduleItems = async (client, recurringScheduleId, userId, count = 4) => {
+  // Get the recurring schedule
+  const scheduleResult = await client.query(`
+    SELECT rs.*, sr.* 
+    FROM recurring_schedules rs
+    JOIN service_requests sr ON rs.service_request_id = sr.id
+    WHERE rs.id = $1
+  `, [recurringScheduleId]);
+  
+  if (scheduleResult.rows.length === 0) {
+    throw new Error('Recurring schedule not found');
+  }
+  
+  const recurringSchedule = scheduleResult.rows[0];
+  
+  // Get exceptions for this recurring schedule
+  const exceptionsResult = await client.query(`
+    SELECT exception_date 
+    FROM schedule_exceptions
+    WHERE recurring_schedule_id = $1
+  `, [recurringScheduleId]);
+  
+  const exceptions = exceptionsResult.rows.map(row => new Date(row.exception_date));
+  
+  // Import RRule library
+  const { RRule, RRuleSet } = require('rrule');
+  
+  // Create RRule from pattern
+  const rule = RRule.fromString(recurringSchedule.rrule_pattern);
+  
+  // Create RRuleSet to handle exceptions
+  const ruleSet = new RRuleSet();
+  ruleSet.rrule(rule);
+  
+  // Add exceptions
+  exceptions.forEach(exceptionDate => {
+    ruleSet.exdate(exceptionDate);
+  });
+  
+  // Get next occurrences
+  const now = new Date();
+  const occurrences = ruleSet.after(now, true, count);
+  
+  // Generate schedule items for each occurrence
+  const generatedItems = [];
+  
+  for (const occurrence of occurrences) {
+    // Check if schedule item already exists for this date
+    const existingCheck = await client.query(`
+      SELECT id FROM schedule_items
+      WHERE recurrence_parent_id = $1 AND date = $2
+    `, [recurringScheduleId, occurrence]);
     
-    // Generate occurrences
-    const start = startDate ? new Date(startDate) : new Date();
-    const end = endDate ? new Date(endDate) : new Date(start.getTime() + (90 * 24 * 60 * 60 * 1000)); // Default to 90 days if no end date
-    
-    let occurrences;
-    if (limit) {
-      // If limit is specified, get that many occurrences after start date
-      occurrences = rruleSet.between(start, end, true).slice(0, limit);
-    } else {
-      // Otherwise get all occurrences between start and end dates
-      occurrences = rruleSet.between(start, end, true);
-    }
-    
-    // Begin transaction
-    await client.query('BEGIN');
-    
-    // Create schedule items for each occurrence
-    const createdItems = [];
-    for (const occurrence of occurrences) {
-      // Calculate end date based on service duration or default to 1 hour
-      const duration = pattern.estimated_duration || 60; // in minutes
-      const occurrenceEnd = new Date(occurrence.getTime() + (duration * 60 * 1000));
-      
-      // Create schedule item
-      const itemResult = await client.query(`
+    if (existingCheck.rows.length === 0) {
+      // Create a new schedule item
+      const result = await client.query(`
         INSERT INTO schedule_items 
-          (user_id, title, description, date, end_date, type, 
-           property_id, service_request_id, time_slot, 
-           provider, recurring_schedule_id, completed)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          (user_id, title, description, date, type, 
+           property_id, service_request_id, recurrence_parent_id, completed)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING *
       `, [
-        pattern.homeowner_id, 
-        pattern.title, 
-        pattern.description, 
-        occurrence, 
-        occurrenceEnd, 
-        'service', 
-        pattern.property_id, 
-        pattern.id, 
-        `${occurrence.getHours()}:${occurrence.getMinutes().toString().padStart(2, '0')}`, 
-        pattern.provider_id, 
-        patternId,
+        userId,
+        recurringSchedule.title,
+        recurringSchedule.description,
+        occurrence,
+        'service',
+        recurringSchedule.property_id,
+        recurringSchedule.service_request_id,
+        recurringScheduleId,
         false
       ]);
       
-      createdItems.push(itemResult.rows[0]);
+      generatedItems.push(result.rows[0]);
+      
+      // Create notification for upcoming service
+      await createUpcomingServiceNotification(client, result.rows[0]);
     }
-    
-    // Update next run date for the pattern
-    const nextRun = rruleSet.after(new Date());
-    if (nextRun) {
-      await client.query(`
-        UPDATE recurring_schedules
-        SET next_run = $1, updated_at = NOW()
-        WHERE id = $2
-      `, [nextRun, patternId]);
-    }
-    
-    // Commit transaction
-    await client.query('COMMIT');
-    
-    res.status(200).json({
-      success: true,
-      message: `Generated ${createdItems.length} schedule items`,
-      count: createdItems.length,
-      data: createdItems
-    });
-  } catch (error) {
-    // Rollback transaction on error
-    await client.query('ROLLBACK');
-    
-    console.error('Error generating schedule from pattern:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error generating schedule from pattern',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-};
-
-/**
- * Add exception date to recurring pattern
- * @route POST /api/schedule/recurring/patterns/:id/exceptions
- */
-const addPatternException = async (req, res) => {
-  const { id } = req.params;
-  const { exceptionDate } = req.body;
-  const client = req.db;
-  const userId = req.user.id;
-  
-  if (!exceptionDate) {
-    return res.status(400).json({
-      success: false,
-      message: 'Exception date is required'
-    });
   }
   
-  try {
-    // Check if pattern exists
-    const patternCheck = await client.query(`
-      SELECT rs.*, sr.homeowner_id, sr.provider_id 
-      FROM recurring_schedules rs
-      JOIN service_requests sr ON rs.service_request_id = sr.id
-      WHERE rs.id = $1
-    `, [id]);
-    
-    if (patternCheck.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Recurring pattern not found'
-      });
-    }
-    
-    const pattern = patternCheck.rows[0];
-    
-    // Check if user is authorized to modify this pattern
-    if (req.user.role !== 'admin' && 
-        pattern.homeowner_id !== userId && 
-        pattern.provider_id !== userId) {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to modify this recurring pattern'
-      });
-    }
-    
-    // Check if exception already exists
-    const exceptionCheck = await client.query(`
-      SELECT id FROM recurring_schedule_exceptions 
-      WHERE recurring_schedule_id = $1 AND exception_date = $2
-    `, [id, new Date(exceptionDate)]);
-    
-    if (exceptionCheck.rows.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Exception date already exists for this pattern'
-      });
-    }
-    
-    // Add the exception
-    const exceptionResult = await client.query(`
-      INSERT INTO recurring_schedule_exceptions 
-        (recurring_schedule_id, exception_date, created_at)
-      VALUES ($1, $2, NOW())
-      RETURNING *
-    `, [id, new Date(exceptionDate)]);
-    
-    // Get all exceptions for this pattern
-    const allExceptions = await client.query(`
-      SELECT * FROM recurring_schedule_exceptions 
-      WHERE recurring_schedule_id = $1
-      ORDER BY exception_date ASC
-    `, [id]);
-    
-    res.status(201).json({
-      success: true,
-      message: 'Exception added successfully',
-      data: exceptionResult.rows[0],
-      allExceptions: allExceptions.rows
-    });
-  } catch (error) {
-    console.error('Error adding pattern exception:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error adding pattern exception',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-};
-
-/**
- * Remove exception date from recurring pattern
- * @route DELETE /api/schedule/recurring/patterns/:id/exceptions/:exceptionId
- */
-const removePatternException = async (req, res) => {
-  const { id, exceptionId } = req.params;
-  const client = req.db;
-  const userId = req.user.id;
-  
-  try {
-    // Check if pattern exists
-    const patternCheck = await client.query(`
-      SELECT rs.*, sr.homeowner_id, sr.provider_id 
-      FROM recurring_schedules rs
-      JOIN service_requests sr ON rs.service_request_id = sr.id
-      WHERE rs.id = $1
-    `, [id]);
-    
-    if (patternCheck.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Recurring pattern not found'
-      });
-    }
-    
-    const pattern = patternCheck.rows[0];
-    
-    // Check if user is authorized to modify this pattern
-    if (req.user.role !== 'admin' && 
-        pattern.homeowner_id !== userId && 
-        pattern.provider_id !== userId) {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to modify this recurring pattern'
-      });
-    }
-    
-    // Check if exception exists
-    const exceptionCheck = await client.query(`
-      SELECT id FROM recurring_schedule_exceptions 
-      WHERE id = $1 AND recurring_schedule_id = $2
-    `, [exceptionId, id]);
-    
-    if (exceptionCheck.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Exception not found for this pattern'
-      });
-    }
-    
-    // Remove the exception
+  // Update next_run in recurring_schedules
+  if (occurrences.length > 0) {
+    const nextAfterLast = rule.after(occurrences[occurrences.length - 1], true);
     await client.query(`
-      DELETE FROM recurring_schedule_exceptions 
-      WHERE id = $1
-    `, [exceptionId]);
-    
-    // Get all remaining exceptions for this pattern
-    const allExceptions = await client.query(`
-      SELECT * FROM recurring_schedule_exceptions 
-      WHERE recurring_schedule_id = $1
-      ORDER BY exception_date ASC
-    `, [id]);
-    
-    res.status(200).json({
-      success: true,
-      message: 'Exception removed successfully',
-      allExceptions: allExceptions.rows
-    });
-  } catch (error) {
-    console.error('Error removing pattern exception:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error removing pattern exception',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+      UPDATE recurring_schedules
+      SET next_run = $1, updated_at = NOW()
+      WHERE id = $2
+    `, [nextAfterLast, recurringScheduleId]);
   }
+  
+  return generatedItems;
 };
 
 /**
- * Get upcoming scheduled services
- * @route GET /api/schedule/upcoming
+ * Helper function to create notification for upcoming service
+ * @param {Object} client - Database client
+ * @param {Object} scheduleItem - Schedule item object
  */
-const getUpcomingScheduledServices = async (req, res) => {
-  const client = req.db;
-  const userId = req.user.id;
-  const { days = 7, limit = 10 } = req.query;
-  
+const createUpcomingServiceNotification = async (client, scheduleItem) => {
   try {
-    // Calculate date range
-    const startDate = new Date();
-    const endDate = new Date(startDate.getTime() + (parseInt(days) * 24 * 60 * 60 * 1000));
+    // Get service request details
+    const serviceRequestResult = await client.query(`
+      SELECT sr.*, p.address 
+      FROM service_requests sr
+      LEFT JOIN properties p ON sr.property_id = p.id
+      WHERE sr.id = $1
+    `, [scheduleItem.service_request_id]);
     
-    // Get upcoming schedule items for this user
-    const result = await client.query(`
-      SELECT s.*, 
-        p.address as property_address, p.city as property_city, 
-        p.state as property_state, p.zip_code as property_zip_code,
-        rs.rrule_pattern
-      FROM schedule_items s
-      LEFT JOIN properties p ON s.property_id = p.id
-      LEFT JOIN recurring_schedules rs ON s.recurring_schedule_id = rs.id
-      WHERE (s.user_id = $1 OR s.provider = $1)
-        AND s.date >= $2 AND s.date <= $3
-        AND s.completed = false
-      ORDER BY s.date ASC
-      LIMIT $4
-    `, [userId, startDate, endDate, limit]);
-    
-    res.status(200).json({
-      success: true,
-      count: result.rows.length,
-      data: result.rows
-    });
-  } catch (error) {
-    console.error('Error getting upcoming scheduled services:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching upcoming scheduled services',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-};
-
-/**
- * Trigger notifications for upcoming scheduled services
- * @route POST /api/schedule/notify/upcoming
- */
-const notifyUpcomingServices = async (req, res) => {
-  const client = req.db;
-  const { days = 1 } = req.body;
-  
-  try {
-    // Only admin or system can trigger notifications for all users
-    if (req.user.role !== 'admin' && req.user.role !== 'system') {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to trigger notifications for all users'
-      });
+    if (serviceRequestResult.rows.length === 0) {
+      return;
     }
     
-    // Calculate date range for upcoming services
-    const startDate = new Date();
-    const endDate = new Date(startDate.getTime() + (parseInt(days) * 24 * 60 * 60 * 1000));
+    const serviceRequest = serviceRequestResult.rows[0];
     
-    // Get upcoming schedule items
-    const scheduleResult = await client.query(`
-      SELECT s.*, 
-        p.address as property_address,
-        u.id as homeowner_id, u.email as homeowner_email,
-        sp.id as provider_id, sp.email as provider_email
-      FROM schedule_items s
-      LEFT JOIN properties p ON s.property_id = p.id
-      LEFT JOIN users u ON s.user_id = u.id
-      LEFT JOIN users sp ON s.provider = sp.id
-      WHERE s.date >= $1 AND s.date <= $2
-        AND s.completed = false
-    `, [startDate, endDate]);
+    // Format date for notification
+    const scheduleDate = new Date(scheduleItem.date);
+    const formattedDate = scheduleDate.toLocaleDateString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    });
     
-    // Begin transaction
-    await client.query('BEGIN');
+    // Create notification for homeowner
+    await client.query(`
+      INSERT INTO notifications 
+        (user_id, title, message, type, related_to, related_id, is_read, delivery_status, actions, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+    `, [
+      serviceRequest.homeowner_id,
+      'Upcoming Scheduled Service',
+      `You have a scheduled service for ${serviceRequest.title} at ${serviceRequest.address} on ${formattedDate}.`,
+      'info',
+      'SCHEDULE',
+      scheduleItem.id,
+      false,
+      'pending',
+      JSON.stringify([
+        {
+          label: 'View Details',
+          action: 'VIEW_SCHEDULE',
+          data: { scheduleId: scheduleItem.id }
+        }
+      ])
+    ]);
     
-    // Create notifications for each upcoming service
-    const notifications = [];
-    for (const service of scheduleResult.rows) {
-      // Format date for display
-      const serviceDate = new Date(service.date);
-      const formattedDate = serviceDate.toLocaleDateString('en-US', { 
-        weekday: 'long', 
-        year: 'numeric', 
-        month: 'long', 
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit'
-      });
-      
-      // Create notification for homeowner
-      if (service.homeowner_id) {
-        const homeownerNotification = await client.query(`
-          INSERT INTO notifications 
-            (user_id, title, message, type, related_to, related_id, is_read, delivery_status, actions, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-          RETURNING *
-        `, [
-          service.homeowner_id,
-          'Upcoming Service Reminder',
-          `You have a scheduled service on ${formattedDate}${service.property_address ? ` at ${service.property_address}` : ''}.`,
-          'reminder',
-          'schedule',
-          service.id,
-          false,
-          'pending',
-          JSON.stringify([{
+    // If there's a provider assigned, notify them too
+    if (scheduleItem.provider) {
+      await client.query(`
+        INSERT INTO notifications 
+          (user_id, title, message, type, related_to, related_id, is_read, delivery_status, actions, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+      `, [
+        scheduleItem.provider,
+        'Upcoming Service Appointment',
+        `You have a scheduled service appointment for ${serviceRequest.title} at ${serviceRequest.address} on ${formattedDate}.`,
+        'info',
+        'SCHEDULE',
+        scheduleItem.id,
+        false,
+        'pending',
+        JSON.stringify([
+          {
             label: 'View Details',
-            action: 'view_schedule',
-            data: { scheduleId: service.id }
-          }])
-        ]);
-        
-        notifications.push(homeownerNotification.rows[0]);
-      }
-      
-      // Create notification for service provider
-      if (service.provider_id) {
-        const providerNotification = await client.query(`
-          INSERT INTO notifications 
-            (user_id, title, message, type, related_to, related_id, is_read, delivery_status, actions, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-          RETURNING *
-        `, [
-          service.provider_id,
-          'Upcoming Service Reminder',
-          `You have a service scheduled on ${formattedDate}${service.property_address ? ` at ${service.property_address}` : ''}.`,
-          'reminder',
-          'schedule',
-          service.id,
-          false,
-          'pending',
-          JSON.stringify([{
-            label: 'View Details',
-            action: 'view_schedule',
-            data: { scheduleId: service.id }
-          }])
-        ]);
-        
-        notifications.push(providerNotification.rows[0]);
-      }
+            action: 'VIEW_SCHEDULE',
+            data: { scheduleId: scheduleItem.id }
+          }
+        ])
+      ]);
     }
-    
-    // Commit transaction
-    await client.query('COMMIT');
-    
-    // Emit WebSocket events for real-time notifications
-    // This assumes a WebSocket service is available
-    try {
-      const WebSocketService = require('../services/websocket.service');
-      for (const notification of notifications) {
-        WebSocketService.emitToUser(notification.user_id, 'notification', notification);
-        
-        // Update delivery status
-        await client.query(`
-          UPDATE notifications
-          SET delivery_status = 'sent', updated_at = NOW()
-          WHERE id = $1
-        `, [notification.id]);
-      }
-    } catch (wsError) {
-      console.error('WebSocket notification error:', wsError);
-      // Continue execution even if WebSocket fails
-    }
-    
-    res.status(200).json({
-      success: true,
-      message: `Sent ${notifications.length} notifications for upcoming services`,
-      count: notifications.length,
-      data: notifications
-    });
   } catch (error) {
-    // Rollback transaction on error
-    await client.query('ROLLBACK');
-    
-    console.error('Error sending notifications for upcoming services:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error sending notifications for upcoming services',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    console.error('Error creating notification for upcoming service:', error);
   }
 };
 
@@ -1272,14 +1092,10 @@ module.exports = {
   createScheduleItem,
   updateScheduleItem,
   deleteScheduleItem,
-  getUserRecurringPatterns,
-  getRecurringPatternById,
-  createRecurringPattern,
-  updateRecurringPattern,
-  deleteRecurringPattern,
-  generateScheduleFromPattern,
-  addPatternException,
-  removePatternException,
-  getUpcomingScheduledServices,
-  notifyUpcomingServices
+  getRecurringSchedules,
+  getRecurringScheduleById,
+  createRecurringSchedule,
+  updateRecurringSchedule,
+  deleteRecurringSchedule,
+  generateScheduleItemsFromPattern
 };
