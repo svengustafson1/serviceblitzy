@@ -6,42 +6,31 @@ const scheduleController = require('../controllers/schedule.controller');
 // All schedule routes require authentication
 router.use(authMiddleware);
 
+// Regular schedule item routes
 // Get all schedule items for current user
 router.get('/', scheduleController.getUserScheduleItems);
 
 // Get schedule items by date range
 router.get('/range', scheduleController.getScheduleByDateRange);
 
-// Get upcoming scheduled services
-router.get('/upcoming', scheduleController.getUpcomingScheduledServices);
+// Recurring schedule pattern routes
+// Get all recurring schedule patterns for current user
+router.get('/recurring', scheduleController.getRecurringSchedules);
 
-// Recurring schedule pattern management
-// Get all recurring patterns for current user
-router.get('/recurring/patterns', scheduleController.getUserRecurringPatterns);
+// Get recurring schedule pattern by ID
+router.get('/recurring/:id', scheduleController.getRecurringScheduleById);
 
-// Get recurring pattern by ID
-router.get('/recurring/patterns/:id', scheduleController.getRecurringPatternById);
+// Create new recurring schedule pattern
+router.post('/recurring', scheduleController.createRecurringSchedule);
 
-// Create new recurring pattern
-router.post('/recurring/patterns', scheduleController.createRecurringPattern);
+// Update recurring schedule pattern
+router.put('/recurring/:id', scheduleController.updateRecurringSchedule);
 
-// Update recurring pattern
-router.put('/recurring/patterns/:id', scheduleController.updateRecurringPattern);
-
-// Delete recurring pattern
-router.delete('/recurring/patterns/:id', scheduleController.deleteRecurringPattern);
+// Delete recurring schedule pattern
+router.delete('/recurring/:id', scheduleController.deleteRecurringSchedule);
 
 // Generate schedule items from recurring pattern
-router.post('/recurring/generate/:patternId', scheduleController.generateScheduleFromPattern);
-
-// Add exception date to recurring pattern
-router.post('/recurring/patterns/:id/exceptions', scheduleController.addPatternException);
-
-// Remove exception date from recurring pattern
-router.delete('/recurring/patterns/:id/exceptions/:exceptionId', scheduleController.removePatternException);
-
-// Trigger notifications for upcoming scheduled services
-router.post('/notify/upcoming', scheduleController.notifyUpcomingServices);
+router.post('/recurring/:id/generate', scheduleController.generateScheduleItemsFromPattern);
 
 // Get schedule item by ID
 router.get('/:id', scheduleController.getScheduleItemById);
@@ -55,4 +44,4 @@ router.put('/:id', scheduleController.updateScheduleItem);
 // Delete schedule item
 router.delete('/:id', scheduleController.deleteScheduleItem);
 
-module.exports = router;
+module.exports = router; 
