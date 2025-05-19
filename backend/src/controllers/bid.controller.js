@@ -1,6 +1,7 @@
 /**
  * Bid Controller
  * Handles all operations related to service request bids
+ * Includes AI recommendation integration for bid analysis and scoring
  */
 
 // Import notification helper functions
@@ -33,7 +34,8 @@ const getProviderBids = async (req, res) => {
       SELECT b.*, 
         sr.description as request_description, sr.status as request_status,
         s.name as service_name, s.category as service_category,
-        p.address as property_address, p.city as property_city, p.state as property_state
+        p.address as property_address, p.city as property_city, p.state as property_state,
+        b.ai_recommended, b.recommendation_score, b.recommendation_confidence
       FROM bids b
       JOIN service_requests sr ON b.service_request_id = sr.id
       JOIN services s ON sr.service_id = s.id
@@ -76,7 +78,7 @@ const getProviderBids = async (req, res) => {
  * @route GET /api/bids/received
  */
 const getHomeownerReceivedBids = async (req, res) => {
-  const { status, service_request_id, sort_by } = req.query;
+  const { status, service_request_id, sort_by = 'price', recommended_only = 'false' } = req.query;
   const client = req.db;
   
   try {
@@ -102,7 +104,8 @@ const getHomeownerReceivedBids = async (req, res) => {
         s.name as service_name, s.category as service_category,
         p.address as property_address,
         sp.company_name, sp.avg_rating,
-        u.first_name as provider_first_name, u.last_name as provider_last_name
+        u.first_name as provider_first_name, u.last_name as provider_last_name,
+        b.ai_recommended, b.recommendation_score, b.recommendation_confidence
       FROM bids b
       JOIN service_requests sr ON b.service_request_id = sr.id
       JOIN services s ON sr.service_id = s.id
@@ -129,11 +132,29 @@ const getHomeownerReceivedBids = async (req, res) => {
       paramIndex++;
     }
     
-    // Order by recommendation score (if specified), otherwise by price and created_at
-    if (sort_by === 'recommendation') {
-      query += ` ORDER BY b.recommendation_score DESC NULLS LAST, b.price ASC, b.created_at DESC`;
-    } else {
-      query += ` ORDER BY b.price ASC, b.created_at DESC`;
+    // Filter by recommendation if requested
+    if (recommended_only === 'true') {
+      query += ` AND b.ai_recommended = TRUE`;
+    }
+    
+    // Order by selected sort criteria
+    switch (sort_by) {
+      case 'recommendation':
+        query += ` ORDER BY b.recommendation_score DESC NULLS LAST, b.price ASC`;
+        break;
+      case 'rating':
+        query += ` ORDER BY sp.avg_rating DESC NULLS LAST, b.price ASC`;
+        break;
+      case 'price_desc':
+        query += ` ORDER BY b.price DESC`;
+        break;
+      case 'newest':
+        query += ` ORDER BY b.created_at DESC`;
+        break;
+      case 'price':
+      default:
+        query += ` ORDER BY b.price ASC, b.created_at DESC`;
+        break;
     }
     
     const result = await client.query(query, queryParams);
@@ -141,7 +162,9 @@ const getHomeownerReceivedBids = async (req, res) => {
     res.status(200).json({
       success: true,
       count: result.rows.length,
-      data: result.rows
+      data: result.rows,
+      sort_by: sort_by,
+      has_recommendations: result.rows.some(bid => bid.recommendation_score !== null)
     });
   } catch (error) {
     console.error('Error getting received bids:', error);
@@ -171,7 +194,8 @@ const getBidById = async (req, res) => {
         p.address as property_address, p.city as property_city, 
         p.state as property_state, p.zip_code as property_zip_code,
         sp.company_name, sp.avg_rating, sp.user_id as provider_user_id,
-        h.user_id as homeowner_user_id
+        h.user_id as homeowner_user_id,
+        b.ai_recommended, b.recommendation_score, b.recommendation_confidence
       FROM bids b
       JOIN service_requests sr ON b.service_request_id = sr.id
       JOIN services s ON sr.service_id = s.id
@@ -288,6 +312,9 @@ const updateBid = async (req, res) => {
       });
     }
     
+    // Start a transaction
+    await client.query('BEGIN');
+    
     // Update the bid
     const result = await client.query(`
       UPDATE bids
@@ -300,62 +327,64 @@ const updateBid = async (req, res) => {
       RETURNING *
     `, [price, estimated_hours, description, id]);
     
-    // Get the updated bid for AI recommendation processing
     const updatedBid = result.rows[0];
     
-    // Get service request details
-    const serviceRequestResult = await client.query(
-      'SELECT * FROM service_requests WHERE id = $1',
-      [updatedBid.service_request_id]
-    );
+    // Get service request and provider details for AI recommendation
+    const serviceRequestResult = await client.query(`
+      SELECT sr.*, s.name as service_name, s.category as service_category
+      FROM service_requests sr
+      JOIN services s ON sr.service_id = s.id
+      WHERE sr.id = $1
+    `, [updatedBid.service_request_id]);
     
-    // Get provider details
-    const providerResult = await client.query(
-      'SELECT * FROM service_providers WHERE id = $1',
-      [providerId]
-    );
+    const providerResult = await client.query(`
+      SELECT sp.*, u.first_name, u.last_name
+      FROM service_providers sp
+      JOIN users u ON sp.user_id = u.id
+      WHERE sp.id = $1
+    `, [providerId]);
     
-    // Get other bids for this service request
-    const otherBidsResult = await client.query(
-      'SELECT * FROM bids WHERE service_request_id = $1 AND id != $2',
-      [updatedBid.service_request_id, updatedBid.id]
-    );
+    // Get other bids for this service request for comparison
+    const otherBidsResult = await client.query(`
+      SELECT * FROM bids WHERE service_request_id = $1 AND id != $2
+    `, [updatedBid.service_request_id, id]);
     
-    // Generate AI recommendation
-    if (serviceRequestResult.rows.length > 0 && providerResult.rows.length > 0) {
-      try {
-        const recommendation = await aiRecommendationService.generateRecommendation(
-          updatedBid,
-          serviceRequestResult.rows[0],
-          providerResult.rows[0],
-          otherBidsResult.rows
-        );
-        
-        // Update bid with recommendation data
-        await client.query(`
-          UPDATE bids
-          SET 
-            ai_recommended = $1,
-            recommendation_score = $2,
-            recommendation_confidence = $3
-          WHERE id = $4
-        `, [
-          recommendation.score > 0.7, // Flag as recommended if score is high
-          recommendation.score,
-          recommendation.confidence,
-          updatedBid.id
-        ]);
-        
-        // Add recommendation data to the result
-        updatedBid.ai_recommended = recommendation.score > 0.7;
-        updatedBid.recommendation_score = recommendation.score;
-        updatedBid.recommendation_confidence = recommendation.confidence;
-        updatedBid.recommendation_explanation = recommendation.explanation;
-      } catch (recError) {
-        console.error('Error generating recommendation for updated bid:', recError);
-        // Continue without recommendation data
-      }
+    // Generate AI recommendation for the updated bid
+    try {
+      const recommendation = await aiRecommendationService.generateRecommendation(
+        updatedBid,
+        serviceRequestResult.rows[0],
+        providerResult.rows[0],
+        otherBidsResult.rows
+      );
+      
+      // Update bid with recommendation data
+      await client.query(`
+        UPDATE bids
+        SET 
+          ai_recommended = $1,
+          recommendation_score = $2,
+          recommendation_confidence = $3
+        WHERE id = $4
+      `, [
+        recommendation.score > 0.7, // Flag as recommended if score is high
+        recommendation.score,
+        recommendation.confidence,
+        id
+      ]);
+      
+      // Add recommendation data to the response
+      updatedBid.ai_recommended = recommendation.score > 0.7;
+      updatedBid.recommendation_score = recommendation.score;
+      updatedBid.recommendation_confidence = recommendation.confidence;
+      updatedBid.recommendation_explanation = recommendation.explanation;
+    } catch (aiError) {
+      console.error('Error generating AI recommendation for updated bid:', aiError);
+      // Continue without recommendation data if AI service fails
     }
+    
+    // Commit the transaction
+    await client.query('COMMIT');
     
     res.status(200).json({
       success: true,
@@ -363,6 +392,9 @@ const updateBid = async (req, res) => {
       data: updatedBid
     });
   } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
     console.error('Error updating bid:', error);
     res.status(500).json({
       success: false,
@@ -469,9 +501,10 @@ const submitBid = async (req, res) => {
   try {
     // Check if service request exists and is in bidding status
     const serviceRequestCheck = await client.query(`
-      SELECT sr.*, h.user_id as homeowner_user_id
+      SELECT sr.*, h.user_id as homeowner_user_id, s.name as service_name, s.category as service_category
       FROM service_requests sr
       JOIN homeowners h ON sr.homeowner_id = h.id
+      JOIN services s ON sr.service_id = s.id
       WHERE sr.id = $1
     `, [id]);
     
@@ -503,27 +536,14 @@ const submitBid = async (req, res) => {
     }
     
     // Get provider details for AI recommendation
-    const providerResult = await client.query(
-      'SELECT * FROM service_providers WHERE id = $1',
-      [providerId]
-    );
-    
-    if (providerResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Provider details not found'
-      });
-    }
+    const providerResult = await client.query(`
+      SELECT sp.*, u.first_name, u.last_name
+      FROM service_providers sp
+      JOIN users u ON sp.user_id = u.id
+      WHERE sp.id = $1
+    `, [providerId]);
     
     const provider = providerResult.rows[0];
-    
-    // Get other bids for this service request for comparison
-    const otherBidsResult = await client.query(
-      'SELECT * FROM bids WHERE service_request_id = $1',
-      [id]
-    );
-    
-    const otherBids = otherBidsResult.rows;
     
     // Start a transaction
     await client.query('BEGIN');
@@ -536,11 +556,9 @@ const submitBid = async (req, res) => {
     
     let result;
     let isNewBid = false;
-    let bidId;
     
     if (existingBidCheck.rows.length > 0) {
       // Update existing bid
-      bidId = existingBidCheck.rows[0].id;
       result = await client.query(`
         UPDATE bids
         SET 
@@ -560,20 +578,23 @@ const submitBid = async (req, res) => {
         RETURNING *
       `, [id, providerId, price, estimated_hours, description, 'pending']);
       
-      bidId = result.rows[0].id;
       isNewBid = true;
     }
     
-    // Create the bid object for AI recommendation
     const bid = result.rows[0];
     
-    // Generate AI recommendation
+    // Get other bids for this service request for comparison
+    const otherBidsResult = await client.query(`
+      SELECT * FROM bids WHERE service_request_id = $1 AND id != $2
+    `, [id, bid.id]);
+    
+    // Generate AI recommendation for the bid
     try {
       const recommendation = await aiRecommendationService.generateRecommendation(
         bid,
         serviceRequest,
         provider,
-        otherBids
+        otherBidsResult.rows
       );
       
       // Update bid with recommendation data
@@ -584,22 +605,21 @@ const submitBid = async (req, res) => {
           recommendation_score = $2,
           recommendation_confidence = $3
         WHERE id = $4
-        RETURNING *
       `, [
         recommendation.score > 0.7, // Flag as recommended if score is high
         recommendation.score,
         recommendation.confidence,
-        bidId
+        bid.id
       ]);
       
-      // Add recommendation data to the result
+      // Add recommendation data to the response
       bid.ai_recommended = recommendation.score > 0.7;
       bid.recommendation_score = recommendation.score;
       bid.recommendation_confidence = recommendation.confidence;
       bid.recommendation_explanation = recommendation.explanation;
-    } catch (recError) {
-      console.error('Error generating recommendation:', recError);
-      // Continue without recommendation data
+    } catch (aiError) {
+      console.error('Error generating AI recommendation:', aiError);
+      // Continue without recommendation data if AI service fails
     }
     
     // If service request is still in 'pending' status, update it to 'bidding'
@@ -757,6 +777,203 @@ const acceptBid = async (req, res) => {
 };
 
 /**
+ * Get AI recommendations for bids on a service request
+ * @route GET /api/service-requests/:id/recommendations
+ */
+const getRecommendationsForServiceRequest = async (req, res) => {
+  const { id } = req.params;
+  const client = req.db;
+  
+  try {
+    // Get homeowner ID from user ID
+    const homeownerResult = await client.query(
+      'SELECT id FROM homeowners WHERE user_id = $1',
+      [req.user.id]
+    );
+    
+    if (homeownerResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Homeowner profile not found'
+      });
+    }
+    
+    const homeownerId = homeownerResult.rows[0].id;
+    
+    // Check if service request exists and belongs to this homeowner
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, s.name as service_name, s.category as service_category
+      FROM service_requests sr
+      JOIN services s ON sr.service_id = s.id
+      WHERE sr.id = $1 AND sr.homeowner_id = $2
+    `, [id, homeownerId]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found or you are not authorized to access it'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Get all bids for this service request
+    const bidsResult = await client.query(`
+      SELECT b.*, sp.company_name, sp.avg_rating, sp.description as provider_description,
+        u.first_name as provider_first_name, u.last_name as provider_last_name
+      FROM bids b
+      JOIN service_providers sp ON b.provider_id = sp.id
+      JOIN users u ON sp.user_id = u.id
+      WHERE b.service_request_id = $1
+    `, [id]);
+    
+    if (bidsResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No bids found for this service request'
+      });
+    }
+    
+    const bids = bidsResult.rows;
+    
+    // Create a map of providers by provider_id
+    const providers = {};
+    for (const bid of bids) {
+      providers[bid.provider_id] = {
+        id: bid.provider_id,
+        company_name: bid.company_name,
+        avg_rating: bid.avg_rating,
+        description: bid.provider_description,
+        first_name: bid.provider_first_name,
+        last_name: bid.provider_last_name
+      };
+      
+      // Remove provider fields from bid object to avoid duplication
+      delete bid.company_name;
+      delete bid.avg_rating;
+      delete bid.provider_description;
+      delete bid.provider_first_name;
+      delete bid.provider_last_name;
+    }
+    
+    // Check if bids already have recommendation data
+    const hasRecommendations = bids.some(bid => bid.recommendation_score !== null);
+    
+    // If recommendations don't exist or need to be refreshed, generate them
+    if (!hasRecommendations) {
+      try {
+        // Get AI recommendation service monitoring stats
+        const monitoringStats = aiRecommendationService.getMonitoringStats();
+        
+        // Check if AI service is available
+        if (monitoringStats.state === 'open') {
+          // Circuit is open, use deterministic ranking
+          console.log('AI recommendation circuit is open, using deterministic ranking');
+          
+          // Process bids with deterministic ranking
+          for (const bid of bids) {
+            const provider = providers[bid.provider_id];
+            const recommendation = aiRecommendationService._internal.deterministicRanking(
+              bid,
+              provider,
+              bids.filter(b => b.id !== bid.id)
+            );
+            
+            // Update bid with recommendation data
+            await client.query(`
+              UPDATE bids
+              SET 
+                ai_recommended = $1,
+                recommendation_score = $2,
+                recommendation_confidence = $3
+              WHERE id = $4
+            `, [
+              recommendation.score > 0.7,
+              recommendation.score,
+              recommendation.confidence,
+              bid.id
+            ]);
+            
+            // Update bid object with recommendation data
+            bid.ai_recommended = recommendation.score > 0.7;
+            bid.recommendation_score = recommendation.score;
+            bid.recommendation_confidence = recommendation.confidence;
+            bid.recommendation_explanation = recommendation.explanation;
+            bid.is_fallback_recommendation = true;
+          }
+        } else {
+          // Circuit is closed or half-open, use AI recommendation service
+          const processedBids = await aiRecommendationService.batchProcessBids(
+            bids,
+            serviceRequest,
+            providers
+          );
+          
+          // Update bids with recommendation data
+          for (const bid of processedBids) {
+            if (bid.recommendation_score !== undefined) {
+              await client.query(`
+                UPDATE bids
+                SET 
+                  ai_recommended = $1,
+                  recommendation_score = $2,
+                  recommendation_confidence = $3
+                WHERE id = $4
+              `, [
+                bid.ai_recommended,
+                bid.recommendation_score,
+                bid.recommendation_confidence,
+                bid.id
+              ]);
+            }
+          }
+          
+          // Replace bids array with processed bids
+          bids.length = 0;
+          bids.push(...processedBids);
+        }
+      } catch (aiError) {
+        console.error('Error generating AI recommendations:', aiError);
+        // Continue with existing data if AI service fails
+      }
+    }
+    
+    // Sort bids by recommendation score (highest first)
+    bids.sort((a, b) => {
+      // Handle null scores
+      if (a.recommendation_score === null && b.recommendation_score === null) return 0;
+      if (a.recommendation_score === null) return 1;
+      if (b.recommendation_score === null) return -1;
+      
+      // Sort by score (descending)
+      return b.recommendation_score - a.recommendation_score;
+    });
+    
+    // Get AI recommendation service status
+    const aiServiceStatus = aiRecommendationService.getMonitoringStats();
+    
+    res.status(200).json({
+      success: true,
+      count: bids.length,
+      data: bids,
+      providers: providers,
+      ai_service_status: {
+        state: aiServiceStatus.state,
+        error_rate: aiServiceStatus.errorRate,
+        using_fallback: bids.some(bid => bid.is_fallback_recommendation)
+      }
+    });
+  } catch (error) {
+    console.error('Error getting recommendations:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching recommendations',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
  * Helper function to get provider ID from user ID
  */
 const getProviderIdFromUserId = async (client, userId) => {
@@ -775,5 +992,6 @@ module.exports = {
   updateBid,
   deleteBid,
   submitBid,
-  acceptBid
-};
+  acceptBid,
+  getRecommendationsForServiceRequest
+}; 
