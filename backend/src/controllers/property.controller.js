@@ -1,7 +1,29 @@
 const crypto = require('crypto');
 const fileUploadService = require('../services/file-upload.service');
 const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
+const path = require('path');
+
+// Configure multer for memory storage (files stored in buffer for S3 upload)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Check allowed file types
+    const allowedTypes = [
+      'image/jpeg', 'image/png', 'image/gif',
+      'application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv'
+    ];
+    
+    if (!allowedTypes.includes(file.mimetype)) {
+      return cb(new Error('File type not allowed'), false);
+    }
+    
+    cb(null, true);
+  }
+}).array('files', 5); // Allow up to 5 files per request
 
 /**
  * Get all properties (admin only)
@@ -415,7 +437,7 @@ const getPropertyByHash = async (req, res) => {
 };
 
 /**
- * Upload files for a property
+ * Upload files to a property
  * @route POST /api/properties/:id/files
  */
 const uploadPropertyFiles = async (req, res) => {
@@ -440,93 +462,103 @@ const uploadPropertyFiles = async (req, res) => {
     
     const property = checkResult.rows[0];
     
-    // Check if user is authorized to upload files for this property
-    if (req.user.role !== 'admin' && String(req.user.id) !== String(property.homeowner_user_id)) {
+    // Check if user is authorized to upload files to this property
+    if (req.user.role !== 'admin' && req.user.id !== property.homeowner_user_id) {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to upload files for this property'
+        message: 'Not authorized to upload files to this property'
       });
     }
     
-    // Check if files were uploaded
-    if (!req.file && (!req.files || req.files.length === 0)) {
-      return res.status(400).json({
-        success: false,
-        message: 'No files were uploaded'
-      });
-    }
-    
-    // Process single file upload
-    if (req.file) {
-      const fileMetadata = await processFileUpload(req.file, id, req.user.id, req.body.description || '');
-      return res.status(201).json({
-        success: true,
-        message: 'File uploaded successfully',
-        data: fileMetadata
-      });
-    }
-    
-    // Process multiple file uploads
-    const uploadPromises = req.files.map(file => {
-      return processFileUpload(file, id, req.user.id, req.body.description || '');
-    });
-    
-    const uploadedFiles = await Promise.all(uploadPromises);
-    
-    res.status(201).json({
-      success: true,
-      message: 'Files uploaded successfully',
-      data: uploadedFiles
+    // Process file upload using multer
+    upload(req, res, async (err) => {
+      if (err) {
+        console.error('Error processing file upload:', err);
+        return res.status(400).json({
+          success: false,
+          message: err.message || 'Error processing file upload'
+        });
+      }
+      
+      // Check if files were uploaded
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'No files uploaded'
+        });
+      }
+      
+      try {
+        const uploadResults = [];
+        const fileUploads = [];
+        
+        // Upload each file to S3
+        for (const file of req.files) {
+          const description = req.body.descriptions ? 
+            req.body.descriptions[req.files.indexOf(file)] : '';
+          
+          // Upload file to S3
+          const fileMetadata = await fileUploadService.uploadFile(file, {
+            entityType: 'property',
+            entityId: id,
+            description
+          });
+          
+          // Store file metadata in database
+          const fileUploadResult = await client.query(`
+            INSERT INTO file_uploads 
+              (user_id, related_to, related_id, file_url, metadata)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+          `, [
+            req.user.id,
+            'PROPERTY',
+            id,
+            fileMetadata.location,
+            JSON.stringify({
+              originalFilename: fileMetadata.originalFilename,
+              mimeType: fileMetadata.mimeType,
+              size: fileMetadata.size,
+              key: fileMetadata.key,
+              bucket: fileMetadata.bucket,
+              description
+            })
+          ]);
+          
+          uploadResults.push({
+            id: fileUploadResult.rows[0].id,
+            url: fileMetadata.location,
+            originalFilename: fileMetadata.originalFilename,
+            mimeType: fileMetadata.mimeType,
+            size: fileMetadata.size,
+            description
+          });
+          
+          fileUploads.push(fileUploadResult.rows[0].id);
+        }
+        
+        res.status(200).json({
+          success: true,
+          message: `${uploadResults.length} file(s) uploaded successfully`,
+          data: uploadResults
+        });
+      } catch (uploadError) {
+        console.error('Error uploading files to S3:', uploadError);
+        res.status(500).json({
+          success: false,
+          message: 'Error uploading files',
+          error: process.env.NODE_ENV === 'development' ? uploadError.message : undefined
+        });
+      }
     });
   } catch (error) {
-    console.error('Error uploading property files:', error);
+    console.error('Error in file upload process:', error);
     res.status(500).json({
       success: false,
-      message: 'Error uploading files',
+      message: 'Error processing file upload',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
-};
-
-/**
- * Helper function to process file upload and save metadata to database
- */
-const processFileUpload = async (file, propertyId, userId, description) => {
-  // Upload file to S3 using the file upload service
-  const fileMetadata = await fileUploadService.uploadFile(file, {
-    entityType: 'property',
-    entityId: propertyId,
-    description
-  });
-  
-  // Save file metadata to database
-  const client = global.dbClient; // Access the global DB client
-  const result = await client.query(`
-    INSERT INTO file_uploads 
-      (user_id, related_to, related_id, file_url, metadata)
-    VALUES ($1, $2, $3, $4, $5)
-    RETURNING id
-  `, [
-    userId,
-    'PROPERTY',
-    propertyId,
-    fileMetadata.location,
-    JSON.stringify({
-      originalFilename: fileMetadata.originalFilename,
-      mimeType: fileMetadata.mimeType,
-      size: fileMetadata.size,
-      key: fileMetadata.key,
-      bucket: fileMetadata.bucket,
-      description
-    })
-  ]);
-  
-  // Return combined metadata
-  return {
-    id: result.rows[0].id,
-    ...fileMetadata,
-    description
-  };
 };
 
 /**
@@ -565,45 +597,30 @@ const getPropertyFiles = async (req, res) => {
       });
     }
     
-    // Get files from database
+    // Get files for this property
     const filesResult = await client.query(`
-      SELECT f.*, u.first_name, u.last_name 
+      SELECT f.id, f.user_id, f.file_url, f.metadata, f.created_at,
+        u.first_name, u.last_name
       FROM file_uploads f
       JOIN users u ON f.user_id = u.id
       WHERE f.related_to = 'PROPERTY' AND f.related_id = $1
       ORDER BY f.created_at DESC
     `, [id]);
     
-    // Generate pre-signed URLs for each file if needed
-    const files = await Promise.all(filesResult.rows.map(async (file) => {
+    // Format the response
+    const files = filesResult.rows.map(file => {
       const metadata = file.metadata || {};
-      let fileUrl = file.file_url;
-      
-      // Generate a pre-signed URL if the file is stored in S3
-      if (metadata.key && metadata.bucket) {
-        try {
-          fileUrl = await fileUploadService.generatePresignedUrl(metadata.key, {
-            operation: 'getObject',
-            expiresIn: 3600, // 1 hour
-            user: req.user
-          });
-        } catch (error) {
-          console.error('Error generating pre-signed URL:', error);
-          // Continue with the original URL if pre-signed URL generation fails
-        }
-      }
-      
       return {
         id: file.id,
-        fileName: metadata.originalFilename || 'Unknown',
-        fileType: metadata.mimeType || 'application/octet-stream',
-        fileSize: metadata.size || 0,
-        description: metadata.description || '',
+        url: file.file_url,
         uploadedBy: `${file.first_name} ${file.last_name}`,
         uploadedAt: file.created_at,
-        url: fileUrl
+        originalFilename: metadata.originalFilename || 'Unknown',
+        mimeType: metadata.mimeType || 'application/octet-stream',
+        size: metadata.size || 0,
+        description: metadata.description || ''
       };
-    }));
+    });
     
     res.status(200).json({
       success: true,
@@ -621,7 +638,7 @@ const getPropertyFiles = async (req, res) => {
 };
 
 /**
- * Delete a property file
+ * Delete a file from a property
  * @route DELETE /api/properties/:propertyId/files/:fileId
  */
 const deletePropertyFile = async (req, res) => {
@@ -646,11 +663,11 @@ const deletePropertyFile = async (req, res) => {
     
     const property = checkResult.rows[0];
     
-    // Check if user is authorized to delete files for this property
-    if (req.user.role !== 'admin' && String(req.user.id) !== String(property.homeowner_user_id)) {
+    // Check if user is authorized to delete files from this property
+    if (req.user.role !== 'admin' && req.user.id !== property.homeowner_user_id) {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to delete files for this property'
+        message: 'Not authorized to delete files from this property'
       });
     }
     
@@ -663,25 +680,28 @@ const deletePropertyFile = async (req, res) => {
     if (fileResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
-        message: 'File not found'
+        message: 'File not found for this property'
       });
     }
     
     const file = fileResult.rows[0];
     const metadata = file.metadata || {};
     
-    // Delete file from S3 if key exists
+    // Delete file from S3 if key exists in metadata
     if (metadata.key) {
       try {
         await fileUploadService.deleteFile(metadata.key, req.user);
-      } catch (error) {
-        console.error('Error deleting file from S3:', error);
+      } catch (s3Error) {
+        console.error('Error deleting file from S3:', s3Error);
         // Continue with database deletion even if S3 deletion fails
       }
     }
     
     // Delete file record from database
-    await client.query('DELETE FROM file_uploads WHERE id = $1', [fileId]);
+    await client.query(
+      'DELETE FROM file_uploads WHERE id = $1',
+      [fileId]
+    );
     
     res.status(200).json({
       success: true,
@@ -698,10 +718,10 @@ const deletePropertyFile = async (req, res) => {
 };
 
 /**
- * Get a single property file with pre-signed URL
- * @route GET /api/properties/:propertyId/files/:fileId
+ * Generate a pre-signed URL for file download
+ * @route GET /api/properties/:propertyId/files/:fileId/download
  */
-const getPropertyFile = async (req, res) => {
+const getFileDownloadUrl = async (req, res) => {
   const { propertyId, fileId } = req.params;
   const client = req.db;
   
@@ -735,55 +755,47 @@ const getPropertyFile = async (req, res) => {
     
     // Get file information
     const fileResult = await client.query(`
-      SELECT f.*, u.first_name, u.last_name 
-      FROM file_uploads f
-      JOIN users u ON f.user_id = u.id
-      WHERE f.id = $1 AND f.related_to = 'PROPERTY' AND f.related_id = $2
+      SELECT * FROM file_uploads
+      WHERE id = $1 AND related_to = 'PROPERTY' AND related_id = $2
     `, [fileId, propertyId]);
     
     if (fileResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
-        message: 'File not found'
+        message: 'File not found for this property'
       });
     }
     
     const file = fileResult.rows[0];
     const metadata = file.metadata || {};
-    let fileUrl = file.file_url;
     
-    // Generate a pre-signed URL if the file is stored in S3
-    if (metadata.key && metadata.bucket) {
-      try {
-        fileUrl = await fileUploadService.generatePresignedUrl(metadata.key, {
-          operation: 'getObject',
-          expiresIn: 3600, // 1 hour
-          user: req.user
-        });
-      } catch (error) {
-        console.error('Error generating pre-signed URL:', error);
-        // Continue with the original URL if pre-signed URL generation fails
-      }
+    if (!metadata.key) {
+      return res.status(400).json({
+        success: false,
+        message: 'File metadata is missing required information'
+      });
     }
+    
+    // Generate pre-signed URL for file download
+    const downloadUrl = await fileUploadService.generatePresignedUrl(metadata.key, {
+      operation: 'getObject',
+      expiresIn: 3600, // URL expires in 1 hour
+      user: req.user
+    });
     
     res.status(200).json({
       success: true,
       data: {
-        id: file.id,
-        fileName: metadata.originalFilename || 'Unknown',
-        fileType: metadata.mimeType || 'application/octet-stream',
-        fileSize: metadata.size || 0,
-        description: metadata.description || '',
-        uploadedBy: `${file.first_name} ${file.last_name}`,
-        uploadedAt: file.created_at,
-        url: fileUrl
+        downloadUrl,
+        expiresIn: 3600,
+        filename: metadata.originalFilename || 'download'
       }
     });
   } catch (error) {
-    console.error('Error getting property file:', error);
+    console.error('Error generating download URL:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching file',
+      message: 'Error generating download URL',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -799,6 +811,6 @@ module.exports = {
   getPropertyByHash,
   uploadPropertyFiles,
   getPropertyFiles,
-  getPropertyFile,
-  deletePropertyFile
-}; 
+  deletePropertyFile,
+  getFileDownloadUrl
+};
