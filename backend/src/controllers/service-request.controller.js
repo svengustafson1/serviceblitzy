@@ -1,10 +1,15 @@
 /**
  * Service Request Controller
  * Handles all operations related to service requests
+ * Includes file attachment support for service documentation
  */
 
-// Import the notification helper functions
+// Import the notification helper functions and file upload service
 const { createServiceRequestNotification } = require('./notification.controller');
+const fileUploadService = require('../services/file-upload.service');
+const { createLogger } = require('../utils/logger');
+
+const logger = createLogger('service-request-controller');
 
 /**
  * Get all service requests (filtered by query params)
@@ -112,13 +117,29 @@ const getAllServiceRequests = async (req, res) => {
     
     const result = await client.query(query, queryParams);
     
+    // Enhance response with file attachments
+    const enhancedResults = await Promise.all(result.rows.map(async (request) => {
+      // Get file attachments if any
+      if (request.attachment_ids && Array.isArray(request.attachment_ids)) {
+        try {
+          // Get file metadata for each attachment
+          const fileMetadata = await getFileMetadataForServiceRequest(client, request.id);
+          return { ...request, attachments: fileMetadata };
+        } catch (error) {
+          logger.error(`Error fetching attachments for service request ${request.id}:`, error);
+          return { ...request, attachments: [] };
+        }
+      }
+      return { ...request, attachments: [] };
+    }));
+    
     res.status(200).json({
       success: true,
-      count: result.rows.length,
-      data: result.rows
+      count: enhancedResults.length,
+      data: enhancedResults
     });
   } catch (error) {
-    console.error('Error getting service requests:', error);
+    logger.error('Error getting service requests:', error);
     res.status(500).json({
       success: false,
       message: 'Error fetching service requests',
@@ -227,12 +248,16 @@ const getServiceRequestById = async (req, res) => {
       serviceRequest.bids = bidsResult.rows;
     }
     
+    // Get file attachments if any
+    const fileMetadata = await getFileMetadataForServiceRequest(client, id);
+    serviceRequest.attachments = fileMetadata;
+    
     res.status(200).json({
       success: true,
       data: serviceRequest
     });
   } catch (error) {
-    console.error('Error getting service request:', error);
+    logger.error('Error getting service request:', error);
     res.status(500).json({
       success: false,
       message: 'Error fetching service request',
@@ -252,7 +277,8 @@ const createServiceRequest = async (req, res) => {
     description, 
     preferred_date, 
     is_recurring, 
-    recurrence_frequency 
+    recurrence_frequency,
+    attachment_ids // Array of file upload IDs
   } = req.body;
   const client = req.db;
   
@@ -306,11 +332,45 @@ const createServiceRequest = async (req, res) => {
       });
     }
     
-    // Create the service request
+    // Start a transaction
+    await client.query('BEGIN');
+    
+    // Validate attachment_ids if provided
+    let validatedAttachmentIds = [];
+    if (attachment_ids && Array.isArray(attachment_ids) && attachment_ids.length > 0) {
+      try {
+        // Verify each attachment exists and belongs to this user
+        const attachmentResult = await client.query(
+          'SELECT id FROM file_uploads WHERE id = ANY($1::int[]) AND user_id = $2',
+          [attachment_ids, req.user.id]
+        );
+        
+        if (attachmentResult.rows.length !== attachment_ids.length) {
+          // Some attachments were not found or don't belong to this user
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            success: false,
+            message: 'One or more attachments are invalid or do not belong to you'
+          });
+        }
+        
+        validatedAttachmentIds = attachmentResult.rows.map(row => row.id);
+      } catch (error) {
+        await client.query('ROLLBACK');
+        logger.error('Error validating attachments:', error);
+        return res.status(500).json({
+          success: false,
+          message: 'Error validating attachments',
+          error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+      }
+    }
+    
+    // Create the service request with attachment_ids
     const result = await client.query(`
       INSERT INTO service_requests
-        (homeowner_id, property_id, service_id, status, description, preferred_date, is_recurring, recurrence_frequency)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        (homeowner_id, property_id, service_id, status, description, preferred_date, is_recurring, recurrence_frequency, attachment_ids)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *
     `, [
       homeownerId, 
@@ -320,8 +380,20 @@ const createServiceRequest = async (req, res) => {
       description,
       preferred_date,
       is_recurring || false,
-      recurrence_frequency
+      recurrence_frequency,
+      validatedAttachmentIds.length > 0 ? JSON.stringify(validatedAttachmentIds) : null
     ]);
+    
+    // If attachments were provided, update their related_id to link them to this service request
+    if (validatedAttachmentIds.length > 0) {
+      await client.query(
+        'UPDATE file_uploads SET related_id = $1, related_to = $2 WHERE id = ANY($3::int[])',
+        [result.rows[0].id, 'SERVICE_REQUEST', validatedAttachmentIds]
+      );
+    }
+    
+    // Commit the transaction
+    await client.query('COMMIT');
     
     // Get additional information to return
     const enhancedResult = await client.query(`
@@ -334,13 +406,30 @@ const createServiceRequest = async (req, res) => {
       WHERE sr.id = $1
     `, [result.rows[0].id]);
     
+    // Get file metadata for attachments
+    const fileMetadata = await getFileMetadataForServiceRequest(client, result.rows[0].id);
+    
+    // Create notification for the homeowner
+    await createServiceRequestNotification(
+      client,
+      result.rows[0].id,
+      req.user.id,
+      'created'
+    );
+    
     res.status(201).json({
       success: true,
       message: 'Service request created successfully',
-      data: enhancedResult.rows[0]
+      data: {
+        ...enhancedResult.rows[0],
+        attachments: fileMetadata
+      }
     });
   } catch (error) {
-    console.error('Error creating service request:', error);
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
+    logger.error('Error creating service request:', error);
     res.status(500).json({
       success: false,
       message: 'Error creating service request',
@@ -359,11 +448,15 @@ const updateServiceRequest = async (req, res) => {
     description, 
     preferred_date, 
     is_recurring, 
-    recurrence_frequency 
+    recurrence_frequency,
+    attachment_ids // Array of file upload IDs to add/replace
   } = req.body;
   const client = req.db;
   
   try {
+    // Start a transaction
+    await client.query('BEGIN');
+    
     // Check if service request exists and belongs to this user
     const serviceRequestCheck = await client.query(`
       SELECT sr.*, h.user_id as homeowner_user_id
@@ -373,6 +466,7 @@ const updateServiceRequest = async (req, res) => {
     `, [id]);
     
     if (serviceRequestCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({
         success: false,
         message: 'Service request not found'
@@ -383,6 +477,7 @@ const updateServiceRequest = async (req, res) => {
     
     // Only homeowner who owns this request or admin can update it
     if (req.user.role !== 'admin' && req.user.id !== parseInt(serviceRequest.homeowner_user_id)) {
+      await client.query('ROLLBACK');
       return res.status(403).json({
         success: false,
         message: 'Not authorized to update this service request'
@@ -391,10 +486,75 @@ const updateServiceRequest = async (req, res) => {
     
     // Can only update if status is 'pending' or 'bidding'
     if (!['pending', 'bidding'].includes(serviceRequest.status)) {
+      await client.query('ROLLBACK');
       return res.status(400).json({
         success: false,
         message: `Cannot update a service request with status '${serviceRequest.status}'`
       });
+    }
+    
+    // Handle attachment updates if provided
+    let updatedAttachmentIds = serviceRequest.attachment_ids || [];
+    if (attachment_ids !== undefined) {
+      if (Array.isArray(attachment_ids)) {
+        try {
+          // Verify each attachment exists and belongs to this user
+          const attachmentResult = await client.query(
+            'SELECT id FROM file_uploads WHERE id = ANY($1::int[]) AND user_id = $2',
+            [attachment_ids, req.user.id]
+          );
+          
+          if (attachmentResult.rows.length !== attachment_ids.length) {
+            // Some attachments were not found or don't belong to this user
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              success: false,
+              message: 'One or more attachments are invalid or do not belong to you'
+            });
+          }
+          
+          updatedAttachmentIds = attachmentResult.rows.map(row => row.id);
+          
+          // Update the related_id for new attachments
+          await client.query(
+            'UPDATE file_uploads SET related_id = $1, related_to = $2 WHERE id = ANY($3::int[])',
+            [id, 'SERVICE_REQUEST', updatedAttachmentIds]
+          );
+          
+          // If there were previous attachments that are no longer included, update their related_id to null
+          if (serviceRequest.attachment_ids && Array.isArray(serviceRequest.attachment_ids)) {
+            const removedAttachmentIds = serviceRequest.attachment_ids.filter(
+              oldId => !updatedAttachmentIds.includes(oldId)
+            );
+            
+            if (removedAttachmentIds.length > 0) {
+              await client.query(
+                'UPDATE file_uploads SET related_id = NULL, related_to = NULL WHERE id = ANY($1::int[])',
+                [removedAttachmentIds]
+              );
+            }
+          }
+        } catch (error) {
+          await client.query('ROLLBACK');
+          logger.error('Error updating attachments:', error);
+          return res.status(500).json({
+            success: false,
+            message: 'Error updating attachments',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+          });
+        }
+      } else if (attachment_ids === null) {
+        // If attachment_ids is explicitly set to null, remove all attachments
+        updatedAttachmentIds = null;
+        
+        // Update any existing attachments to remove the relation
+        if (serviceRequest.attachment_ids && Array.isArray(serviceRequest.attachment_ids)) {
+          await client.query(
+            'UPDATE file_uploads SET related_id = NULL, related_to = NULL WHERE id = ANY($1::int[])',
+            [serviceRequest.attachment_ids]
+          );
+        }
+      }
     }
     
     // Update the service request
@@ -405,18 +565,48 @@ const updateServiceRequest = async (req, res) => {
         preferred_date = COALESCE($2, preferred_date),
         is_recurring = COALESCE($3, is_recurring),
         recurrence_frequency = COALESCE($4, recurrence_frequency),
+        attachment_ids = COALESCE($5, attachment_ids),
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = $5
+      WHERE id = $6
       RETURNING *
-    `, [description, preferred_date, is_recurring, recurrence_frequency, id]);
+    `, [
+      description, 
+      preferred_date, 
+      is_recurring, 
+      recurrence_frequency, 
+      updatedAttachmentIds !== undefined ? 
+        (updatedAttachmentIds && updatedAttachmentIds.length > 0 ? JSON.stringify(updatedAttachmentIds) : null) : 
+        undefined,
+      id
+    ]);
+    
+    // Commit the transaction
+    await client.query('COMMIT');
+    
+    // Get file metadata for attachments
+    const fileMetadata = await getFileMetadataForServiceRequest(client, id);
+    
+    // Create notification for the homeowner
+    await createServiceRequestNotification(
+      client,
+      id,
+      req.user.id,
+      'updated'
+    );
     
     res.status(200).json({
       success: true,
       message: 'Service request updated successfully',
-      data: result.rows[0]
+      data: {
+        ...result.rows[0],
+        attachments: fileMetadata
+      }
     });
   } catch (error) {
-    console.error('Error updating service request:', error);
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
+    logger.error('Error updating service request:', error);
     res.status(500).json({
       success: false,
       message: 'Error updating service request',
@@ -434,6 +624,9 @@ const deleteServiceRequest = async (req, res) => {
   const client = req.db;
   
   try {
+    // Start a transaction
+    await client.query('BEGIN');
+    
     // Check if service request exists and belongs to this user
     const serviceRequestCheck = await client.query(`
       SELECT sr.*, h.user_id as homeowner_user_id
@@ -443,6 +636,7 @@ const deleteServiceRequest = async (req, res) => {
     `, [id]);
     
     if (serviceRequestCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({
         success: false,
         message: 'Service request not found'
@@ -453,6 +647,7 @@ const deleteServiceRequest = async (req, res) => {
     
     // Only homeowner who owns this request or admin can delete it
     if (req.user.role !== 'admin' && req.user.id !== parseInt(serviceRequest.homeowner_user_id)) {
+      await client.query('ROLLBACK');
       return res.status(403).json({
         success: false,
         message: 'Not authorized to delete this service request'
@@ -461,14 +656,20 @@ const deleteServiceRequest = async (req, res) => {
     
     // Can only delete if status is 'pending' or 'bidding'
     if (!['pending', 'bidding'].includes(serviceRequest.status)) {
+      await client.query('ROLLBACK');
       return res.status(400).json({
         success: false,
         message: `Cannot delete a service request with status '${serviceRequest.status}'`
       });
     }
     
-    // Start a transaction
-    await client.query('BEGIN');
+    // Update file attachments to remove the relation
+    if (serviceRequest.attachment_ids && Array.isArray(serviceRequest.attachment_ids)) {
+      await client.query(
+        'UPDATE file_uploads SET related_id = NULL, related_to = NULL WHERE id = ANY($1::int[])',
+        [serviceRequest.attachment_ids]
+      );
+    }
     
     // Delete any bids associated with this service request
     await client.query('DELETE FROM bids WHERE service_request_id = $1', [id]);
@@ -487,7 +688,7 @@ const deleteServiceRequest = async (req, res) => {
     // Rollback transaction on error
     await client.query('ROLLBACK');
     
-    console.error('Error deleting service request:', error);
+    logger.error('Error deleting service request:', error);
     res.status(500).json({
       success: false,
       message: 'Error deleting service request',
@@ -661,16 +862,22 @@ const updateServiceRequestStatus = async (req, res) => {
     // Commit the transaction
     await client.query('COMMIT');
     
+    // Get file metadata for attachments
+    const fileMetadata = await getFileMetadataForServiceRequest(client, id);
+    
     res.status(200).json({
       success: true,
       message: `Service request status updated to ${status}`,
-      data: result.rows[0]
+      data: {
+        ...result.rows[0],
+        attachments: fileMetadata
+      }
     });
   } catch (error) {
     // Rollback transaction on error
     await client.query('ROLLBACK');
     
-    console.error('Error updating service request status:', error);
+    logger.error('Error updating service request status:', error);
     res.status(500).json({
       success: false,
       message: 'Error updating service request status',
@@ -799,7 +1006,7 @@ const getServiceRequestBids = async (req, res) => {
       data: bidsResult.rows
     });
   } catch (error) {
-    console.error('Error getting bids:', error);
+    logger.error('Error getting bids:', error);
     res.status(500).json({
       success: false,
       message: 'Error fetching bids',
@@ -907,12 +1114,531 @@ const submitBid = async (req, res) => {
       data: result.rows[0]
     });
   } catch (error) {
-    console.error('Error submitting bid:', error);
+    logger.error('Error submitting bid:', error);
     res.status(500).json({
       success: false,
       message: 'Error submitting bid',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  }
+};
+
+/**
+ * Upload files for a service request
+ * @route POST /api/service-requests/:id/attachments
+ */
+const uploadServiceRequestAttachments = async (req, res) => {
+  const { id } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if service request exists and belongs to this user
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Only homeowner who owns this request or admin can add attachments
+    if (req.user.role !== 'admin' && req.user.id !== parseInt(serviceRequest.homeowner_user_id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to add attachments to this service request'
+      });
+    }
+    
+    // Can only add attachments if status is 'pending', 'bidding', or 'in_progress'
+    if (!['pending', 'bidding', 'in_progress'].includes(serviceRequest.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot add attachments to a service request with status '${serviceRequest.status}'`
+      });
+    }
+    
+    // Check if files were uploaded
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No files were uploaded'
+      });
+    }
+    
+    // Start a transaction
+    await client.query('BEGIN');
+    
+    // Process each uploaded file
+    const uploadedFiles = [];
+    const fileIds = [];
+    
+    for (const file of req.files) {
+      try {
+        // Upload file to S3 using the file upload service
+        const fileMetadata = await fileUploadService.uploadFile(file, {
+          entityType: 'service-request',
+          entityId: id,
+          description: `Attachment for service request #${id}`
+        });
+        
+        // Store file metadata in the database
+        const fileResult = await client.query(`
+          INSERT INTO file_uploads
+            (user_id, related_to, related_id, file_url, metadata)
+          VALUES ($1, $2, $3, $4, $5)
+          RETURNING *
+        `, [
+          req.user.id,
+          'SERVICE_REQUEST',
+          id,
+          fileMetadata.location,
+          JSON.stringify({
+            originalFilename: fileMetadata.originalFilename,
+            mimeType: fileMetadata.mimeType,
+            size: fileMetadata.size,
+            key: fileMetadata.key,
+            bucket: fileMetadata.bucket
+          })
+        ]);
+        
+        uploadedFiles.push(fileResult.rows[0]);
+        fileIds.push(fileResult.rows[0].id);
+      } catch (error) {
+        logger.error(`Error uploading file ${file.originalname}:`, error);
+        // Continue with other files even if one fails
+      }
+    }
+    
+    // If no files were successfully uploaded, rollback and return error
+    if (uploadedFiles.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to upload any files'
+      });
+    }
+    
+    // Update the service request with the new attachment IDs
+    let currentAttachmentIds = serviceRequest.attachment_ids || [];
+    if (Array.isArray(currentAttachmentIds)) {
+      currentAttachmentIds = [...currentAttachmentIds, ...fileIds];
+    } else {
+      currentAttachmentIds = fileIds;
+    }
+    
+    await client.query(`
+      UPDATE service_requests
+      SET attachment_ids = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+    `, [JSON.stringify(currentAttachmentIds), id]);
+    
+    // Commit the transaction
+    await client.query('COMMIT');
+    
+    // Create notification for the homeowner
+    await createServiceRequestNotification(
+      client,
+      id,
+      serviceRequest.homeowner_user_id,
+      'updated'
+    );
+    
+    res.status(200).json({
+      success: true,
+      message: `Successfully uploaded ${uploadedFiles.length} file(s)`,
+      data: uploadedFiles
+    });
+  } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
+    logger.error('Error uploading attachments:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error uploading attachments',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Get attachments for a service request
+ * @route GET /api/service-requests/:id/attachments
+ */
+const getServiceRequestAttachments = async (req, res) => {
+  const { id } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if service request exists
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Check authorization
+    if (req.user.role === 'homeowner' && req.user.id !== parseInt(serviceRequest.homeowner_user_id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to access this service request'
+      });
+    }
+    
+    // For providers, we need to check if they can see this request
+    if (req.user.role === 'provider') {
+      const providerId = await getProviderIdFromUserId(client, req.user.id);
+      
+      if (!providerId) {
+        return res.status(404).json({
+          success: false,
+          message: 'Provider profile not found'
+        });
+      }
+      
+      // Providers can see:
+      // 1. Requests with status 'pending' or 'bidding'
+      // 2. Requests where they have placed bids
+      // 3. Requests where they have been awarded the job
+      if (!['pending', 'bidding'].includes(serviceRequest.status)) {
+        // Check if provider has placed a bid
+        const bidCheck = await client.query(
+          'SELECT id FROM bids WHERE service_request_id = $1 AND provider_id = $2',
+          [id, providerId]
+        );
+        
+        // If no bid placed and not a pending/bidding request, deny access
+        if (bidCheck.rows.length === 0) {
+          return res.status(403).json({
+            success: false,
+            message: 'Not authorized to access this service request'
+          });
+        }
+      }
+    }
+    
+    // Get file metadata for attachments
+    const fileMetadata = await getFileMetadataForServiceRequest(client, id);
+    
+    res.status(200).json({
+      success: true,
+      count: fileMetadata.length,
+      data: fileMetadata
+    });
+  } catch (error) {
+    logger.error('Error getting attachments:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching attachments',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Delete an attachment from a service request
+ * @route DELETE /api/service-requests/:id/attachments/:fileId
+ */
+const deleteServiceRequestAttachment = async (req, res) => {
+  const { id, fileId } = req.params;
+  const client = req.db;
+  
+  try {
+    // Start a transaction
+    await client.query('BEGIN');
+    
+    // Check if service request exists and belongs to this user
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Only homeowner who owns this request or admin can delete attachments
+    if (req.user.role !== 'admin' && req.user.id !== parseInt(serviceRequest.homeowner_user_id)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to delete attachments from this service request'
+      });
+    }
+    
+    // Can only delete attachments if status is 'pending' or 'bidding'
+    if (!['pending', 'bidding'].includes(serviceRequest.status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete attachments from a service request with status '${serviceRequest.status}'`
+      });
+    }
+    
+    // Check if the file exists and belongs to this service request
+    const fileCheck = await client.query(`
+      SELECT * FROM file_uploads 
+      WHERE id = $1 AND related_to = 'SERVICE_REQUEST' AND related_id = $2
+    `, [fileId, id]);
+    
+    if (fileCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'File not found or does not belong to this service request'
+      });
+    }
+    
+    const file = fileCheck.rows[0];
+    
+    // Update the file to remove the relation to the service request
+    await client.query(`
+      UPDATE file_uploads
+      SET related_id = NULL, related_to = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+    `, [fileId]);
+    
+    // Update the service request to remove the file ID from attachment_ids
+    if (serviceRequest.attachment_ids && Array.isArray(serviceRequest.attachment_ids)) {
+      const updatedAttachmentIds = serviceRequest.attachment_ids.filter(
+        attachmentId => attachmentId !== parseInt(fileId)
+      );
+      
+      await client.query(`
+        UPDATE service_requests
+        SET attachment_ids = $1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+      `, [
+        updatedAttachmentIds.length > 0 ? JSON.stringify(updatedAttachmentIds) : null,
+        id
+      ]);
+    }
+    
+    // Try to delete the file from S3 (but don't fail if this doesn't work)
+    try {
+      if (file.metadata && file.metadata.key) {
+        await fileUploadService.deleteFile(file.metadata.key, req.user);
+      }
+    } catch (deleteError) {
+      logger.error(`Error deleting file from S3: ${deleteError.message}`);
+      // Continue even if S3 deletion fails
+    }
+    
+    // Commit the transaction
+    await client.query('COMMIT');
+    
+    res.status(200).json({
+      success: true,
+      message: 'File attachment removed successfully'
+    });
+  } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
+    logger.error('Error deleting attachment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting attachment',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Generate a pre-signed URL for downloading an attachment
+ * @route GET /api/service-requests/:id/attachments/:fileId/download
+ */
+const getAttachmentDownloadUrl = async (req, res) => {
+  const { id, fileId } = req.params;
+  const client = req.db;
+  
+  try {
+    // Check if service request exists
+    const serviceRequestCheck = await client.query(`
+      SELECT sr.*, h.user_id as homeowner_user_id
+      FROM service_requests sr
+      JOIN homeowners h ON sr.homeowner_id = h.id
+      WHERE sr.id = $1
+    `, [id]);
+    
+    if (serviceRequestCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service request not found'
+      });
+    }
+    
+    const serviceRequest = serviceRequestCheck.rows[0];
+    
+    // Check authorization
+    if (req.user.role === 'homeowner' && req.user.id !== parseInt(serviceRequest.homeowner_user_id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to access this service request'
+      });
+    }
+    
+    // For providers, we need to check if they can see this request
+    if (req.user.role === 'provider') {
+      const providerId = await getProviderIdFromUserId(client, req.user.id);
+      
+      if (!providerId) {
+        return res.status(404).json({
+          success: false,
+          message: 'Provider profile not found'
+        });
+      }
+      
+      // Providers can see:
+      // 1. Requests with status 'pending' or 'bidding'
+      // 2. Requests where they have placed bids
+      // 3. Requests where they have been awarded the job
+      if (!['pending', 'bidding'].includes(serviceRequest.status)) {
+        // Check if provider has placed a bid
+        const bidCheck = await client.query(
+          'SELECT id FROM bids WHERE service_request_id = $1 AND provider_id = $2',
+          [id, providerId]
+        );
+        
+        // If no bid placed and not a pending/bidding request, deny access
+        if (bidCheck.rows.length === 0) {
+          return res.status(403).json({
+            success: false,
+            message: 'Not authorized to access this service request'
+          });
+        }
+      }
+    }
+    
+    // Check if the file exists and belongs to this service request
+    const fileCheck = await client.query(`
+      SELECT * FROM file_uploads 
+      WHERE id = $1 AND related_to = 'SERVICE_REQUEST' AND related_id = $2
+    `, [fileId, id]);
+    
+    if (fileCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'File not found or does not belong to this service request'
+      });
+    }
+    
+    const file = fileCheck.rows[0];
+    
+    // Generate a pre-signed URL for downloading the file
+    if (!file.metadata || !file.metadata.key) {
+      return res.status(400).json({
+        success: false,
+        message: 'File metadata is missing or invalid'
+      });
+    }
+    
+    const downloadUrl = await fileUploadService.generatePresignedUrl(file.metadata.key, {
+      operation: 'getObject',
+      expiresIn: 3600, // URL expires in 1 hour
+      user: req.user
+    });
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        downloadUrl,
+        expiresIn: 3600,
+        fileName: file.metadata.originalFilename || 'download',
+        mimeType: file.metadata.mimeType || 'application/octet-stream'
+      }
+    });
+  } catch (error) {
+    logger.error('Error generating download URL:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating download URL',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+/**
+ * Helper function to get file metadata for a service request
+ * @param {Object} client - Database client
+ * @param {Number} serviceRequestId - Service request ID
+ * @returns {Promise<Array>} - Array of file metadata objects
+ */
+const getFileMetadataForServiceRequest = async (client, serviceRequestId) => {
+  try {
+    // Get the service request to check for attachment_ids
+    const serviceRequestResult = await client.query(
+      'SELECT attachment_ids FROM service_requests WHERE id = $1',
+      [serviceRequestId]
+    );
+    
+    if (serviceRequestResult.rows.length === 0 || 
+        !serviceRequestResult.rows[0].attachment_ids || 
+        !Array.isArray(serviceRequestResult.rows[0].attachment_ids) || 
+        serviceRequestResult.rows[0].attachment_ids.length === 0) {
+      return [];
+    }
+    
+    const attachmentIds = serviceRequestResult.rows[0].attachment_ids;
+    
+    // Get file metadata for each attachment
+    const fileResult = await client.query(`
+      SELECT id, user_id, file_url, metadata, created_at, updated_at
+      FROM file_uploads
+      WHERE id = ANY($1::int[])
+    `, [attachmentIds]);
+    
+    // Process the results to include presigned URLs
+    return fileResult.rows.map(file => {
+      let metadata = {};
+      try {
+        metadata = typeof file.metadata === 'string' ? 
+          JSON.parse(file.metadata) : 
+          (file.metadata || {});
+      } catch (error) {
+        logger.error(`Error parsing file metadata for file ${file.id}:`, error);
+      }
+      
+      return {
+        id: file.id,
+        user_id: file.user_id,
+        file_url: file.file_url,
+        originalFilename: metadata.originalFilename || 'unknown',
+        mimeType: metadata.mimeType || 'application/octet-stream',
+        size: metadata.size || 0,
+        created_at: file.created_at,
+        updated_at: file.updated_at
+      };
+    });
+  } catch (error) {
+    logger.error(`Error getting file metadata for service request ${serviceRequestId}:`, error);
+    return [];
   }
 };
 
@@ -978,5 +1704,9 @@ module.exports = {
   deleteServiceRequest,
   updateServiceRequestStatus,
   getServiceRequestBids,
-  submitBid
-}; 
+  submitBid,
+  uploadServiceRequestAttachments,
+  getServiceRequestAttachments,
+  deleteServiceRequestAttachment,
+  getAttachmentDownloadUrl
+};

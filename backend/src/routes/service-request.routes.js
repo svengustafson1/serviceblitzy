@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authMiddleware, authorizeRoles } = require('../middleware/auth.middleware');
+const { uploadSingleFile, uploadMultipleFiles, handleMulterError } = require('../middleware/file-upload.middleware');
 const serviceRequestController = require('../controllers/service-request.controller');
 
 // Routes
@@ -17,4 +18,34 @@ router.post('/:id/bids', authMiddleware, authorizeRoles(['provider']), serviceRe
 // Status update routes
 router.patch('/:id/status', authMiddleware, serviceRequestController.updateServiceRequestStatus);
 
-module.exports = router; 
+// File attachment routes
+router.post('/:id/attachments', 
+  authMiddleware, 
+  uploadSingleFile, 
+  handleMulterError, 
+  serviceRequestController.uploadServiceRequestAttachment
+);
+
+router.post('/:id/attachments/batch', 
+  authMiddleware, 
+  uploadMultipleFiles, 
+  handleMulterError, 
+  serviceRequestController.uploadMultipleServiceRequestAttachments
+);
+
+router.get('/:id/attachments', 
+  authMiddleware, 
+  serviceRequestController.getServiceRequestAttachments
+);
+
+router.delete('/:id/attachments/:fileId', 
+  authMiddleware, 
+  serviceRequestController.deleteServiceRequestAttachment
+);
+
+router.get('/:id/attachments/:fileId/url', 
+  authMiddleware, 
+  serviceRequestController.getAttachmentPresignedUrl
+);
+
+module.exports = router;

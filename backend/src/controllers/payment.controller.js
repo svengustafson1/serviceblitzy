@@ -1,6 +1,6 @@
 /**
  * Payment Controller
- * Handles all payment-related operations using Stripe
+ * Handles all payment-related operations using Stripe and Stripe Connect
  */
 let stripe;
 
@@ -18,8 +18,22 @@ try {
 // Import notification helper functions
 const { createPaymentNotification } = require('./notification.controller');
 
+// Import payout controller for provider payment processing
+const { createProviderPayout } = require('./payout.controller');
+
 // Helper function to check if Stripe is configured
 const isStripeConfigured = () => !!stripe;
+
+/**
+ * Calculate platform fee based on payment amount
+ * @param {number} amount - The payment amount
+ * @returns {number} The calculated platform fee
+ */
+const calculatePlatformFee = (amount) => {
+  // Default platform fee is 10% of the payment amount
+  const platformFeePercentage = process.env.PLATFORM_FEE_PERCENTAGE || 0.1;
+  return Math.round(amount * platformFeePercentage * 100) / 100;
+};
 
 /**
  * Create a payment intent for a service request
@@ -73,7 +87,7 @@ const createPaymentIntent = async (req, res) => {
     
     // Verify the bid exists and is accepted for this service request
     const bidCheck = await client.query(`
-      SELECT b.*, sp.user_id as provider_user_id, sp.company_name
+      SELECT b.*, sp.user_id as provider_user_id, sp.company_name, sp.stripe_connect_account_id
       FROM bids b
       JOIN service_providers sp ON b.provider_id = sp.id
       WHERE b.id = $1 AND b.service_request_id = $2 AND b.status = 'accepted'
@@ -88,8 +102,19 @@ const createPaymentIntent = async (req, res) => {
     
     const bid = bidCheck.rows[0];
     
-    // Create a Stripe payment intent
-    const paymentIntent = await stripe.paymentIntents.create({
+    // Check if provider has a Stripe Connect account
+    if (!bid.stripe_connect_account_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Service provider has not completed Stripe Connect onboarding. Please contact support.'
+      });
+    }
+    
+    // Calculate platform fee
+    const platformFee = calculatePlatformFee(amount);
+    
+    // Create a Stripe payment intent with Connect parameters
+    const paymentIntentParams = {
       amount: Math.round(amount * 100), // Convert to cents for Stripe
       currency,
       description: description || `Payment for service: ${serviceRequest.description} to ${bid.company_name}`,
@@ -97,9 +122,20 @@ const createPaymentIntent = async (req, res) => {
         service_request_id,
         bid_id,
         homeowner_id: serviceRequest.homeowner_id,
-        provider_id: bid.provider_id
-      }
-    });
+        provider_id: bid.provider_id,
+        platform_fee: platformFee
+      },
+      // Specify the Connect account as the payment destination
+      transfer_data: {
+        destination: bid.stripe_connect_account_id,
+        // The amount to transfer to the provider (total minus platform fee)
+        amount: Math.round((amount - platformFee) * 100)
+      },
+      // Indicate that the application fee will be paid by the connected account
+      application_fee_amount: Math.round(platformFee * 100)
+    };
+    
+    const paymentIntent = await stripe.paymentIntents.create(paymentIntentParams);
     
     // Save the payment intent to the database
     const paymentResult = await client.query(`
@@ -112,9 +148,12 @@ const createPaymentIntent = async (req, res) => {
         amount,
         currency,
         status,
-        description
+        description,
+        platform_fee,
+        provider_amount,
+        stripe_connect_account_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       RETURNING *
     `, [
       paymentIntent.id,
@@ -125,7 +164,10 @@ const createPaymentIntent = async (req, res) => {
       amount,
       currency,
       'pending',
-      description || `Payment for service request #${service_request_id}`
+      description || `Payment for service request #${service_request_id}`,
+      platformFee,
+      amount - platformFee,
+      bid.stripe_connect_account_id
     ]);
     
     // Create notification for homeowner
@@ -142,7 +184,9 @@ const createPaymentIntent = async (req, res) => {
       data: {
         payment_id: paymentResult.rows[0].id,
         client_secret: paymentIntent.client_secret,
-        payment_intent_id: paymentIntent.id
+        payment_intent_id: paymentIntent.id,
+        platform_fee: platformFee,
+        provider_amount: amount - platformFee
       }
     });
   } catch (error) {
@@ -258,6 +302,17 @@ const confirmPayment = async (req, res) => {
       'received'
     );
     
+    // Trigger provider payout processing
+    if (payment.stripe_connect_account_id) {
+      try {
+        await createProviderPayout(client, payment.id);
+      } catch (payoutError) {
+        console.error('Error initiating provider payout:', payoutError);
+        // Continue with payment confirmation even if payout processing fails
+        // The payout will be retried by a scheduled job
+      }
+    }
+    
     // Commit the transaction
     await client.query('COMMIT');
     
@@ -268,6 +323,8 @@ const confirmPayment = async (req, res) => {
         payment_id: payment.id,
         service_request_id: payment.service_request_id,
         amount: payment.amount,
+        platform_fee: payment.platform_fee,
+        provider_amount: payment.provider_amount,
         status: 'completed'
       }
     });
@@ -326,7 +383,7 @@ const handleWebhook = async (req, res) => {
         // Get the service request ID from the payment record
         const paymentCheck = await client.query(`
           SELECT 
-            p.id, p.service_request_id, p.provider_id, 
+            p.id, p.service_request_id, p.provider_id, p.stripe_connect_account_id,
             h.user_id as homeowner_user_id, 
             sp.user_id as provider_user_id
           FROM payments p
@@ -336,7 +393,7 @@ const handleWebhook = async (req, res) => {
         `, [paymentIntent.id]);
         
         if (paymentCheck.rows.length > 0) {
-          const { id, service_request_id, homeowner_user_id, provider_user_id } = paymentCheck.rows[0];
+          const { id, service_request_id, homeowner_user_id, provider_user_id, stripe_connect_account_id } = paymentCheck.rows[0];
           
           // Update the service request status to in_progress if it's still in scheduled status
           const serviceRequestCheck = await client.query(`
@@ -354,6 +411,16 @@ const handleWebhook = async (req, res) => {
           // Create notifications
           await createPaymentNotification(client, id, homeowner_user_id, 'completed');
           await createPaymentNotification(client, id, provider_user_id, 'received');
+          
+          // Trigger provider payout processing
+          if (stripe_connect_account_id) {
+            try {
+              await createProviderPayout(client, id);
+            } catch (payoutError) {
+              console.error('Error initiating provider payout from webhook:', payoutError);
+              // The payout will be retried by a scheduled job
+            }
+          }
         }
         break;
       }
@@ -386,6 +453,106 @@ const handleWebhook = async (req, res) => {
             paymentCheck.rows[0].homeowner_user_id, 
             'failed'
           );
+        }
+        break;
+      }
+      
+      // Handle Stripe Connect specific events
+      case 'account.updated': {
+        const account = event.data.object;
+        
+        // Update the provider's Stripe Connect account status
+        await client.query(`
+          UPDATE service_providers
+          SET 
+            stripe_connect_account_status = $1,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE stripe_connect_account_id = $2
+        `, [account.payouts_enabled ? 'active' : 'pending', account.id]);
+        break;
+      }
+      
+      case 'transfer.created': {
+        const transfer = event.data.object;
+        
+        // Update the payment record with transfer information
+        if (transfer.metadata && transfer.metadata.payment_id) {
+          await client.query(`
+            UPDATE payments
+            SET 
+              stripe_transfer_id = $1,
+              transfer_status = 'pending',
+              updated_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+          `, [transfer.id, transfer.metadata.payment_id]);
+        }
+        break;
+      }
+      
+      case 'transfer.paid': {
+        const transfer = event.data.object;
+        
+        // Update the payment record with transfer status
+        if (transfer.metadata && transfer.metadata.payment_id) {
+          await client.query(`
+            UPDATE payments
+            SET 
+              transfer_status = 'completed',
+              updated_at = CURRENT_TIMESTAMP
+            WHERE stripe_transfer_id = $1
+          `, [transfer.id]);
+          
+          // Get the provider user ID to notify
+          const paymentCheck = await client.query(`
+            SELECT p.id, sp.user_id as provider_user_id
+            FROM payments p
+            JOIN service_providers sp ON p.provider_id = sp.id
+            WHERE p.stripe_transfer_id = $1
+          `, [transfer.id]);
+          
+          if (paymentCheck.rows.length > 0) {
+            // Create notification for transfer completion
+            await createPaymentNotification(
+              client, 
+              paymentCheck.rows[0].id, 
+              paymentCheck.rows[0].provider_user_id, 
+              'transfer_completed'
+            );
+          }
+        }
+        break;
+      }
+      
+      case 'transfer.failed': {
+        const transfer = event.data.object;
+        
+        // Update the payment record with transfer status
+        if (transfer.metadata && transfer.metadata.payment_id) {
+          await client.query(`
+            UPDATE payments
+            SET 
+              transfer_status = 'failed',
+              updated_at = CURRENT_TIMESTAMP
+            WHERE stripe_transfer_id = $1
+          `, [transfer.id]);
+          
+          // Get the provider user ID to notify
+          const paymentCheck = await client.query(`
+            SELECT p.id, sp.user_id as provider_user_id
+            FROM payments p
+            JOIN service_providers sp ON p.provider_id = sp.id
+            WHERE p.stripe_transfer_id = $1
+          `, [transfer.id]);
+          
+          if (paymentCheck.rows.length > 0) {
+            // Create notification for transfer failure
+            await createPaymentNotification(
+              client, 
+              paymentCheck.rows[0].id, 
+              paymentCheck.rows[0].provider_user_id, 
+              'transfer_failed'
+            );
+          }
         }
         break;
       }
@@ -593,6 +760,22 @@ const getPaymentById = async (req, res) => {
       }
     }
     
+    // If this is a Connect payment, get the transfer details
+    if (isStripeConfigured() && payment.stripe_transfer_id) {
+      try {
+        const transfer = await stripe.transfers.retrieve(payment.stripe_transfer_id);
+        payment.transfer_details = {
+          amount: transfer.amount / 100, // Convert from cents
+          status: transfer.reversed ? 'reversed' : 'completed',
+          created: new Date(transfer.created * 1000).toISOString(),
+          destination: transfer.destination
+        };
+      } catch (stripeError) {
+        console.warn('Could not retrieve Stripe transfer:', stripeError);
+        // Continue without the transfer details
+      }
+    }
+    
     res.status(200).json({
       success: true,
       data: payment
@@ -669,12 +852,16 @@ const createRefund = async (req, res) => {
       });
     }
     
+    // Start a transaction
+    await client.query('BEGIN');
+    
     // Retrieve the payment intent from Stripe
     const paymentIntent = await stripe.paymentIntents.retrieve(
       payment.stripe_payment_intent_id
     );
     
     if (!paymentIntent.latest_charge) {
+      await client.query('ROLLBACK');
       return res.status(400).json({
         success: false,
         message: 'No charge found for this payment'
@@ -683,11 +870,18 @@ const createRefund = async (req, res) => {
     
     // Create a refund in Stripe
     const refundAmount = amount ? Math.round(amount * 100) : undefined;
-    const refund = await stripe.refunds.create({
+    const refundParams = {
       charge: paymentIntent.latest_charge,
       amount: refundAmount, // If undefined, refund the full amount
       reason: reason || 'requested_by_customer'
-    });
+    };
+    
+    // If this is a Connect payment, we need to reverse the transfer
+    if (payment.stripe_transfer_id && payment.stripe_connect_account_id) {
+      refundParams.reverse_transfer = true;
+    }
+    
+    const refund = await stripe.refunds.create(refundParams);
     
     // Save the refund to the database
     const refundResult = await client.query(`
@@ -728,6 +922,24 @@ const createRefund = async (req, res) => {
       id
     ]);
     
+    // Create notifications for both homeowner and provider
+    await createPaymentNotification(
+      client,
+      id,
+      payment.homeowner_user_id,
+      'refunded'
+    );
+    
+    await createPaymentNotification(
+      client,
+      id,
+      payment.provider_user_id,
+      'refunded'
+    );
+    
+    // Commit the transaction
+    await client.query('COMMIT');
+    
     res.status(200).json({
       success: true,
       message: 'Refund processed successfully',
@@ -739,6 +951,9 @@ const createRefund = async (req, res) => {
       }
     });
   } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+    
     console.error('Error processing refund:', error);
     res.status(500).json({
       success: false,
@@ -819,7 +1034,8 @@ const getPaymentAnalytics = async (req, res) => {
       query = `
         SELECT 
           DATE_TRUNC('day', payment_date) as day,
-          SUM(amount) as total_amount,
+          SUM(provider_amount) as total_amount,
+          SUM(platform_fee) as total_platform_fee,
           COUNT(*) as transaction_count
         FROM payments
         WHERE provider_id = $${paramIndex} AND status = 'completed'
@@ -834,6 +1050,7 @@ const getPaymentAnalytics = async (req, res) => {
         SELECT 
           DATE_TRUNC('day', payment_date) as day,
           SUM(amount) as total_amount,
+          SUM(platform_fee) as total_platform_fee,
           COUNT(*) as transaction_count
         FROM payments
         WHERE status = 'completed'
@@ -848,15 +1065,21 @@ const getPaymentAnalytics = async (req, res) => {
     
     // Calculate summary statistics
     let totalAmount = 0;
+    let totalPlatformFee = 0;
     let totalTransactions = 0;
     
     result.rows.forEach(row => {
-      totalAmount += parseFloat(row.total_amount);
+      totalAmount += parseFloat(row.total_amount || 0);
+      totalPlatformFee += parseFloat(row.total_platform_fee || 0);
       totalTransactions += parseInt(row.transaction_count);
     });
     
     const averageTransactionValue = totalTransactions > 0 
       ? totalAmount / totalTransactions 
+      : 0;
+    
+    const platformFeePercentage = totalAmount > 0
+      ? (totalPlatformFee / totalAmount) * 100
       : 0;
     
     res.status(200).json({
@@ -865,6 +1088,8 @@ const getPaymentAnalytics = async (req, res) => {
         daily_data: result.rows,
         summary: {
           total_amount: totalAmount.toFixed(2),
+          total_platform_fee: totalPlatformFee.toFixed(2),
+          platform_fee_percentage: platformFeePercentage.toFixed(2) + '%',
           total_transactions: totalTransactions,
           average_transaction_value: averageTransactionValue.toFixed(2),
           period: period,
@@ -891,4 +1116,4 @@ module.exports = {
   getPaymentById,
   createRefund,
   getPaymentAnalytics
-}; 
+};

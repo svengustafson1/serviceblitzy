@@ -34,8 +34,27 @@ Thumbs.db
 # Logs
 logs/
 *.log
+socket-io.log
+ws-server.log
 
 # Backups
 *.tar.gz
 *.backup
 *.bak
+
+# AWS
+.aws/
+aws-config.json
+.aws-credentials
+.aws-credentials.json
+.aws/credentials
+.aws/config
+
+# LocalStack
+.localstack/
+localstack-volume/
+
+# Upload directories
+uploads/
+temp-uploads/
+temp-files/

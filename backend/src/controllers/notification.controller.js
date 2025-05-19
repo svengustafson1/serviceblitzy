@@ -1,14 +1,21 @@
 /**
  * Notification Controller
  * Handles all operations related to user notifications
+ * Includes WebSocket event emission for real-time notifications
+ * and delivery status tracking
  */
+
+// Import WebSocket service
+const { getWebSocketService } = require('../services/websocket.service');
 
 /**
  * Create a new notification
  * @param {Object} client - PostgreSQL client
  * @param {Object} notification - Notification data
+ * @param {boolean} [emitEvent=true] - Whether to emit WebSocket event
+ * @returns {Promise<Object>} Created notification with delivery status
  */
-const createNotification = async (client, notification) => {
+const createNotification = async (client, notification, emitEvent = true) => {
   const {
     user_id,
     title,
@@ -17,7 +24,8 @@ const createNotification = async (client, notification) => {
     related_to = null,
     related_id = null,
     actions = null,
-    expires_at = null
+    expires_at = null,
+    delivery_channels = ['websocket', 'in_app', 'email'] // Default delivery channels
   } = notification;
 
   try {
@@ -45,7 +53,53 @@ const createNotification = async (client, notification) => {
       expires_at
     ]);
 
-    return result.rows[0];
+    const newNotification = result.rows[0];
+    
+    // Initialize delivery status
+    let deliveryStatus = {
+      websocket: { delivered: false, attempted: false, timestamp: null },
+      in_app: { delivered: true, attempted: true, timestamp: Date.now() }, // In-app is always delivered when created
+      email: { delivered: false, attempted: false, timestamp: null }
+    };
+
+    // Emit WebSocket event if enabled and WebSocket service is available
+    if (emitEvent && delivery_channels.includes('websocket')) {
+      const webSocketService = getWebSocketService();
+      if (webSocketService) {
+        try {
+          // Set attempted status before sending
+          deliveryStatus.websocket.attempted = true;
+          
+          // Send notification via WebSocket with fallback to HTTP polling
+          const wsResult = await webSocketService.sendToUser(
+            user_id.toString(),
+            'notification:new',
+            {
+              ...newNotification,
+              actions: actions ? JSON.parse(JSON.stringify(actions)) : null
+            }
+          );
+          
+          // Update delivery status based on WebSocket result
+          deliveryStatus.websocket.delivered = wsResult.delivered;
+          deliveryStatus.websocket.timestamp = Date.now();
+          deliveryStatus.websocket.method = wsResult.method; // 'websocket' or 'http_polling'
+          
+          console.log(`Notification ${newNotification.id} delivery status:`, wsResult);
+        } catch (wsError) {
+          console.error(`WebSocket delivery error for notification ${newNotification.id}:`, wsError);
+          // WebSocket delivery failed, but notification is still created in database
+        }
+      }
+    }
+    
+    // Store delivery status with the notification
+    // In a production system, you would update the notification record with delivery status
+    // For now, we'll just attach it to the returned object
+    return {
+      ...newNotification,
+      delivery_status: deliveryStatus
+    };
   } catch (error) {
     console.error('Error creating notification:', error);
     return null;
@@ -57,8 +111,10 @@ const createNotification = async (client, notification) => {
  * @param {Object} client - PostgreSQL client
  * @param {Array} userIds - Array of user IDs
  * @param {Object} notificationData - Notification data (without user_id)
+ * @param {boolean} [emitEvent=true] - Whether to emit WebSocket event
+ * @returns {Promise<Array>} Array of created notifications with delivery status
  */
-const createNotificationForUsers = async (client, userIds, notificationData) => {
+const createNotificationForUsers = async (client, userIds, notificationData, emitEvent = true) => {
   try {
     const notifications = [];
     
@@ -66,7 +122,7 @@ const createNotificationForUsers = async (client, userIds, notificationData) => 
       const notification = await createNotification(client, {
         ...notificationData,
         user_id: userId
-      });
+      }, emitEvent);
       
       if (notification) {
         notifications.push(notification);
@@ -130,11 +186,16 @@ const getUserNotifications = async (req, res) => {
     
     const unreadCount = parseInt(unreadCountResult.rows[0].count);
     
+    // Check if WebSocket connection is available for this user
+    const webSocketService = getWebSocketService();
+    const hasWebSocketConnection = webSocketService ? webSocketService.isUserConnected(req.user.id.toString()) : false;
+    
     res.status(200).json({
       success: true,
       count: result.rows.length,
       total: totalCount,
       unread: unreadCount,
+      has_websocket: hasWebSocketConnection,
       data: result.rows
     });
   } catch (error) {
@@ -185,6 +246,19 @@ const markNotificationsAsRead = async (req, res) => {
       });
     }
     
+    // Emit WebSocket event for read status update if available
+    const webSocketService = getWebSocketService();
+    if (webSocketService && result.rows.length > 0) {
+      const updatedIds = result.rows.map(row => row.id);
+      webSocketService.sendToUser(
+        req.user.id.toString(),
+        'notification:read',
+        { ids: updatedIds }
+      ).catch(error => {
+        console.error('Error sending read status update via WebSocket:', error);
+      });
+    }
+    
     res.status(200).json({
       success: true,
       message: `${result.rows.length} notifications marked as read`,
@@ -225,6 +299,19 @@ const deleteNotifications = async (req, res) => {
       RETURNING id
     `, [ids, req.user.id]);
     
+    // Emit WebSocket event for deletion if available
+    const webSocketService = getWebSocketService();
+    if (webSocketService && result.rows.length > 0) {
+      const deletedIds = result.rows.map(row => row.id);
+      webSocketService.sendToUser(
+        req.user.id.toString(),
+        'notification:deleted',
+        { ids: deletedIds }
+      ).catch(error => {
+        console.error('Error sending deletion update via WebSocket:', error);
+      });
+    }
+    
     res.status(200).json({
       success: true,
       message: `${result.rows.length} notifications deleted`,
@@ -262,11 +349,16 @@ const getNotificationCount = async (req, res) => {
       [req.user.id]
     );
     
+    // Check if WebSocket connection is available for this user
+    const webSocketService = getWebSocketService();
+    const hasWebSocketConnection = webSocketService ? webSocketService.isUserConnected(req.user.id.toString()) : false;
+    
     res.status(200).json({
       success: true,
       data: {
         total: parseInt(totalCountResult.rows[0].total),
-        unread: parseInt(unreadCountResult.rows[0].unread)
+        unread: parseInt(unreadCountResult.rows[0].unread),
+        has_websocket: hasWebSocketConnection
       }
     });
   } catch (error) {
@@ -385,7 +477,7 @@ const createServiceRequestNotification = async (client, serviceRequestId, userId
         type = 'info';
     }
     
-    // Create notification
+    // Create notification with WebSocket delivery
     return await createNotification(client, {
       user_id: userId,
       title,
@@ -398,7 +490,8 @@ const createServiceRequestNotification = async (client, serviceRequestId, userId
           label: 'View Details',
           url: `/service-requests/${serviceRequestId}`
         }
-      }
+      },
+      delivery_channels: ['websocket', 'in_app', 'email'] // Use all available channels
     });
   } catch (error) {
     console.error('Error creating service request notification:', error);
@@ -468,7 +561,7 @@ const createPaymentNotification = async (client, paymentId, userId, action) => {
         type = 'info';
     }
     
-    // Create notification
+    // Create notification with high priority for payment events
     return await createNotification(client, {
       user_id: userId,
       title,
@@ -481,11 +574,41 @@ const createPaymentNotification = async (client, paymentId, userId, action) => {
           label: 'View Details',
           url: `/payments/${paymentId}`
         }
-      }
+      },
+      delivery_channels: ['websocket', 'in_app', 'email'] // Use all available channels for payment notifications
     });
   } catch (error) {
     console.error('Error creating payment notification:', error);
     return null;
+  }
+};
+
+/**
+ * Check WebSocket connection status for current user
+ * @route GET /api/notifications/websocket-status
+ */
+const getWebSocketStatus = async (req, res) => {
+  try {
+    const webSocketService = getWebSocketService();
+    const isConnected = webSocketService ? webSocketService.isUserConnected(req.user.id.toString()) : false;
+    const circuitState = webSocketService ? webSocketService.getCircuitState() : 'UNAVAILABLE';
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        connected: isConnected,
+        circuit_state: circuitState,
+        socket_count: webSocketService ? webSocketService.getConnectedSocketCount() : 0,
+        user_count: webSocketService ? webSocketService.getConnectedUserCount() : 0
+      }
+    });
+  } catch (error) {
+    console.error('Error getting WebSocket status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching WebSocket status',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 };
 
@@ -496,10 +619,11 @@ module.exports = {
   deleteNotifications,
   getNotificationCount,
   getNotificationById,
+  getWebSocketStatus,
   
   // Export helper functions for use in other controllers
   createNotification,
   createNotificationForUsers,
   createServiceRequestNotification,
   createPaymentNotification
-}; 
+};
